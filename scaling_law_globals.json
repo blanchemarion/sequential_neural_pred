@@ -70,5 +70,19 @@
       "use_torch_compile": true,
       "save_processed_split_examples": true
     }
+  },
+  "generate_scaling_configs": {
+    "t_in_choices": [300],
+    "seeds": [101],
+    "share_to_num_epochs": {
+      "25": 5,
+      "50": 200,
+      "100": 100
+    }
+  },
+  "inference_scaling_law": {
+    "num_sequences": 100,
+    "long_pred_length": 810,
+    "n_plot_examples": 0
   }
 }

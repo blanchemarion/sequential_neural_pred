@@ -33,32 +33,9 @@ from helpers.scaling_law_globals import (
 )
 
 
-PARQUET_FILENAME = "data-clean-all-2pct.parquet"
 
-NPY_PARTITIONS = [
-    {"name": "100", "sequence_frac": 1.0},
-    {"name": "50", "sequence_frac": 0.5},
-    {"name": "25", "sequence_frac": 0.25},
-]
-
-BRAIN_REGION_PARTITIONS = [
-    {"name": "2", "brain_areas": 2},
-    {"name": "4", "brain_areas": 4},
-    {"name": "8", "brain_areas": 8},
-    {"name": "16", "brain_areas": 16},
-]
-
-OUTPUT_DIR = "data_processed"
-INPUT_DIR = "data_raw"
-SEQUENCE_ID_COL = "sequenceId"
-SEQUENCE_SAMPLE_BASE_SEED = 42
-
-# Independent random region subset per (sequence partition × brain partition); reproducible via seed.
-BRAIN_REGION_SAMPLE_BASE_SEED = 4242
-SUBSEQUENCE_LENGTH = 360
-ONLY_FULL_SUBSEQUENCES = True
-
-ID_COLS_DEFAULT = ("sequenceId", "itemPosition")
+# All defaults now live in scaling_law_globals.json (loaded in main()).
+# Helper functions below accept these values as explicit arguments.
 
 
 def load_metadata(json_path):
@@ -93,39 +70,39 @@ def sample_sequence_ids(all_ids: np.ndarray, sequence_frac: float, rng: np.rando
     return all_ids[idx]
 
 
-def subset_df_by_sequences(df: pd.DataFrame, sequence_ids: np.ndarray, id_col: str = SEQUENCE_ID_COL) -> pd.DataFrame:
+def subset_df_by_sequences(df: pd.DataFrame, sequence_ids: np.ndarray, id_col: str = "sequenceId") -> pd.DataFrame:
     """All rows whose id_col is in sequence_ids (full sequences only)."""
     if len(sequence_ids) == 0:
         return df.iloc[0:0].copy()
     return df.loc[df[id_col].isin(sequence_ids)].copy()
 
 
-def list_brain_region_columns(df: pd.DataFrame, id_cols=ID_COLS_DEFAULT) -> list[str]:
+def list_brain_region_columns(df: pd.DataFrame, id_cols=("sequenceId", "itemPosition")) -> list[str]:
     """Sorted region column names (all non-id columns)."""
     id_set = set(id_cols)
     return sorted(c for c in df.columns if c not in id_set)
 
 
-def brain_region_sample_rng(sequence_part_index: int, brain_part_index: int) -> np.random.Generator:
+def brain_region_sample_rng(
+    sequence_part_index: int,
+    brain_part_index: int,
+    brain_region_base_seed: int,
+) -> np.random.Generator:
     """
     Deterministic RNG for picking region columns for one (sequence partition × brain partition).
     Each combination gets its own draw so easier/harder regions do not carry across data splits.
     """
-    seed = (
-        BRAIN_REGION_SAMPLE_BASE_SEED
-        + sequence_part_index * 1_000_003
-        + brain_part_index * 17_389
-    )
+    seed = brain_region_base_seed + sequence_part_index * 1_000_003 + brain_part_index * 17_389
     return np.random.default_rng(seed)
 
 
-def brain_region_sample_seed_value(sequence_part_index: int, brain_part_index: int) -> int:
+def brain_region_sample_seed_value(
+    sequence_part_index: int,
+    brain_part_index: int,
+    brain_region_base_seed: int,
+) -> int:
     """Integer seed matching brain_region_sample_rng (for metadata JSON)."""
-    return int(
-        BRAIN_REGION_SAMPLE_BASE_SEED
-        + sequence_part_index * 1_000_003
-        + brain_part_index * 17_389
-    )
+    return int(brain_region_base_seed + sequence_part_index * 1_000_003 + brain_part_index * 17_389)
 
 
 def sample_brain_region_names(
@@ -152,15 +129,13 @@ def sample_brain_region_names(
 
 def load_parquet_data(
     data_dir="data",
-    parquet_filename: str | None = None,
-    metadata_filename: str | None = None,
+    parquet_filename: str = "data-clean-all.parquet",
+    metadata_filename: str = "data-clean-all.json",
 ):
     """Load a single parquet file and its metadata."""
     data_dir = Path(data_dir)
-    name = parquet_filename if parquet_filename is not None else PARQUET_FILENAME
-    meta_name = metadata_filename if metadata_filename is not None else "data-clean-all.json"
-    parquet_path = data_dir / name
-    metadata_path = data_dir / meta_name
+    parquet_path = data_dir / parquet_filename
+    metadata_path = data_dir / metadata_filename
 
     if not parquet_path.exists():
         raise FileNotFoundError(f"{parquet_path} not found")
@@ -383,6 +358,7 @@ def organize_data_array(
     subsequence_length,
     only_full_subsequences,
     region_cols,
+    id_cols=("sequenceId", "itemPosition"),
 ):
     """
     Organize wide-format parquet data into structured array format with subsequences.
@@ -406,8 +382,7 @@ def organize_data_array(
     print("ORGANIZING DATA INTO ARRAY STRUCTURE WITH SUBSEQUENCES")
     print("="*80)
     
-    # Identify columns
-    id_cols = list(ID_COLS_DEFAULT)
+    id_cols = list(id_cols)
     all_region = sorted([col for col in df.columns if col not in id_cols])
     if region_cols is None:
         region_cols = all_region
@@ -616,9 +591,6 @@ def export_organized_data(
 
 def main():
     """Load parquet once, then build and export one .npy per configured partition."""
-    global SEQUENCE_ID_COL, ID_COLS_DEFAULT, PARQUET_FILENAME, NPY_PARTITIONS, BRAIN_REGION_PARTITIONS
-    global SEQUENCE_SAMPLE_BASE_SEED, BRAIN_REGION_SAMPLE_BASE_SEED, SUBSEQUENCE_LENGTH, ONLY_FULL_SUBSEQUENCES
-
     parser = argparse.ArgumentParser(description="Prepare parquet → data_processed .npy")
     parser.add_argument(
         "--scaling-law-globals",
@@ -630,61 +602,56 @@ def main():
 
     full = load_scaling_law_globals(args.scaling_law_globals)
     pcfg = merge_prepare_data_section(full)
-    paths = merge_paths_section(full)
+    dir_paths = merge_paths_section(full)
     repo = scaling_law_repo_root()
 
-    SEQUENCE_ID_COL = str(pcfg["sequence_id_col"])
-    ID_COLS_DEFAULT = tuple(str(x) for x in pcfg["id_cols"])
-    PARQUET_FILENAME = str(pcfg["parquet_filename"])
-    NPY_PARTITIONS = pcfg["npy_partitions"]
-    BRAIN_REGION_PARTITIONS = pcfg["brain_region_partitions"]
-    SEQUENCE_SAMPLE_BASE_SEED = int(pcfg["sequence_sample_base_seed"])
-    BRAIN_REGION_SAMPLE_BASE_SEED = int(pcfg["brain_region_sample_base_seed"])
-    SUBSEQUENCE_LENGTH = int(pcfg["subsequence_length"])
-    ONLY_FULL_SUBSEQUENCES = bool(pcfg["only_full_subsequences"])
+    sequence_id_col       = str(pcfg["sequence_id_col"])
+    id_cols               = tuple(str(x) for x in pcfg["id_cols"])
+    parquet_filename      = str(pcfg["parquet_filename"])
+    metadata_filename     = str(pcfg["metadata_json_filename"])
+    npy_partitions        = pcfg["npy_partitions"]
+    brain_region_parts    = pcfg["brain_region_partitions"]
+    seq_sample_base_seed  = int(pcfg["sequence_sample_base_seed"])
+    brain_base_seed       = int(pcfg["brain_region_sample_base_seed"])
+    subsequence_length    = int(pcfg["subsequence_length"])
+    only_full_subseq      = bool(pcfg["only_full_subsequences"])
 
     print("="*80)
     print("DATA PREPARATION")
     print("="*80)
 
-    output_dir = resolve_repo_relative(repo, paths["data_processed"])
-    input_dir = resolve_repo_relative(repo, paths["data_raw"])
+    output_dir = resolve_repo_relative(repo, dir_paths["data_processed"])
+    input_dir = resolve_repo_relative(repo, dir_paths["data_raw"])
     df, metadata = load_parquet_data(
         input_dir,
-        parquet_filename=PARQUET_FILENAME,
-        metadata_filename=str(pcfg["metadata_json_filename"]),
+        parquet_filename=parquet_filename,
+        metadata_filename=metadata_filename,
     )
 
-    if SEQUENCE_ID_COL not in df.columns:
-        raise KeyError(f"Column {SEQUENCE_ID_COL!r} required for sequence-level partitions")
+    if sequence_id_col not in df.columns:
+        raise KeyError(f"Column {sequence_id_col!r} required for sequence-level partitions")
 
-    all_seq_ids = np.sort(df[SEQUENCE_ID_COL].unique())
+    all_seq_ids = np.sort(df[sequence_id_col].unique())
     n_seq_total = len(all_seq_ids)
-    print(f"\n   Total distinct {SEQUENCE_ID_COL}: {n_seq_total:,}")
-
-    # Analyze structure
-    # region_cols = analyze_data_structure(df, metadata)
-
-    # Create plots
-    # create_plots(df, region_cols, output_dir='output')
+    print(f"\n   Total distinct {sequence_id_col}: {n_seq_total:,}")
 
     all_export_paths = []
 
-    all_region_cols = list_brain_region_columns(df)
+    all_region_cols = list_brain_region_columns(df, id_cols=id_cols)
     n_regions_available = len(all_region_cols)
     if n_regions_available == 0:
         raise ValueError("No brain region columns in parquet")
 
-    for part_index, part in enumerate(NPY_PARTITIONS):
+    for part_index, part in enumerate(npy_partitions):
         name = part["name"]
         sequence_frac = float(part["sequence_frac"])
         if sequence_frac <= 0:
             raise ValueError(f"Partition {name!r}: sequence_frac must be > 0, got {sequence_frac}")
 
-        rng = np.random.default_rng(SEQUENCE_SAMPLE_BASE_SEED + part_index)
+        rng = np.random.default_rng(seq_sample_base_seed + part_index)
         chosen_ids = sample_sequence_ids(all_seq_ids, sequence_frac, rng)
         n_keep = len(chosen_ids)
-        df_part = subset_df_by_sequences(df, chosen_ids)
+        df_part = subset_df_by_sequences(df, chosen_ids, id_col=sequence_id_col)
 
         print("\n" + "="*80)
         print(f"SEQUENCE PARTITION: {name}  (sequence_frac={sequence_frac})")
@@ -692,15 +659,15 @@ def main():
         print(f"   Sequences kept: {n_keep:,} / {n_seq_total:,}")
         print(f"   Rows in subset: {len(df_part):,}")
 
-        for b_index, bpart in enumerate(BRAIN_REGION_PARTITIONS):
+        for b_index, bpart in enumerate(brain_region_parts):
             bname = bpart["name"]
             n_areas = int(bpart["brain_areas"])
             if n_areas <= 0:
-                raise ValueError(f"BRAIN_REGION_PARTITIONS entry {bname!r}: brain_areas must be > 0")
+                raise ValueError(f"brain_region_partitions entry {bname!r}: brain_areas must be > 0")
 
-            rng_regions = brain_region_sample_rng(part_index, b_index)
+            rng_regions = brain_region_sample_rng(part_index, b_index, brain_base_seed)
             chosen_regions = sample_brain_region_names(all_region_cols, n_areas, rng_regions)
-            brain_seed = brain_region_sample_seed_value(part_index, b_index)
+            brain_seed = brain_region_sample_seed_value(part_index, b_index, brain_base_seed)
 
             print("\n" + "-" * 60)
             print(
@@ -712,9 +679,10 @@ def main():
             data_array, region_names, subsequence_info = organize_data_array(
                 df_part,
                 metadata,
-                subsequence_length=SUBSEQUENCE_LENGTH,
-                only_full_subsequences=ONLY_FULL_SUBSEQUENCES,
+                subsequence_length=subsequence_length,
+                only_full_subsequences=only_full_subseq,
                 region_cols=chosen_regions,
+                id_cols=id_cols,
             )
 
             file_stem = f"data{name}_ba{bname}"
@@ -723,7 +691,7 @@ def main():
                 "sequence_frac": sequence_frac,
                 "n_sequence_ids_total": n_seq_total,
                 "n_sequence_ids_kept": n_keep,
-                "sequence_sample_seed": SEQUENCE_SAMPLE_BASE_SEED + part_index,
+                "sequence_sample_seed": seq_sample_base_seed + part_index,
                 "brain_partition": bname,
                 "brain_areas_requested": n_areas,
                 "n_brain_regions_in_array": len(chosen_regions),
@@ -753,7 +721,7 @@ def main():
     print("\nSummary (full parquet):")
     print(f"  - Raw dataset: {df.shape[0]:,} rows × {df.shape[1]} columns")
     print(f"  - Distinct sequences: {n_seq_total:,}")
-    print(f"  - Brain region columns in parquet: {len(list_brain_region_columns(df))}")
+    print(f"  - Brain region columns in parquet: {len(list_brain_region_columns(df, id_cols=id_cols))}")
     print("\nExported (sequence × brain):")
     for name, paths in all_export_paths:
         print(f"  - {name}: {paths['full_array']}")

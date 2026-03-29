@@ -1,6 +1,6 @@
 # Install PyTorch for your platform (CPU/CUDA) if the default wheel is wrong:
 #   https://pytorch.org/get-started/locally/
-torch>=2.0.0
+#torch>=2.0.0
 
 numpy>=1.24.0
 pandas>=2.0.0

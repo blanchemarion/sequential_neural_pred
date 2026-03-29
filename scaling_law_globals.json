@@ -73,7 +73,7 @@
   },
   "generate_scaling_configs": {
     "t_in_choices": [30, 90, 300],
-    "seeds": [101, 102, 103, 104, 105],
+    "seeds": [101],
     "share_to_num_epochs": {
       "25": 400,
       "50": 200,

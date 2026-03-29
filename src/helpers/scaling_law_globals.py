@@ -56,23 +56,23 @@ def merge_paths_section(full: dict[str, Any]) -> dict[str, str]:
 
 def merge_prepare_data_section(full: dict[str, Any]) -> dict[str, Any]:
     defaults: dict[str, Any] = {
-        "parquet_filename": "data-clean-all-2pct.parquet",
+        "parquet_filename": "data-clean-all.parquet",
         "metadata_json_filename": "data-clean-all.json",
         "npy_partitions": [
             {"name": "100", "sequence_frac": 1.0},
-            {"name": "50", "sequence_frac": 0.5},
-            {"name": "25", "sequence_frac": 0.25},
+            #{"name": "50", "sequence_frac": 0.5},
+            #{"name": "25", "sequence_frac": 0.25},
         ],
         "brain_region_partitions": [
-            {"name": "2", "brain_areas": 2},
-            {"name": "4", "brain_areas": 4},
-            {"name": "8", "brain_areas": 8},
+            #{"name": "2", "brain_areas": 2},
+            #{"name": "4", "brain_areas": 4},
+            #{"name": "8", "brain_areas": 8},
             {"name": "16", "brain_areas": 16},
         ],
         "sequence_id_col": "sequenceId",
         "sequence_sample_base_seed": 42,
         "brain_region_sample_base_seed": 4242,
-        "subsequence_length": 360,
+        "subsequence_length": 390,
         "only_full_subsequences": True,
         "id_cols": ["sequenceId", "itemPosition"],
     }
@@ -87,9 +87,9 @@ def merge_prepare_data_section(full: dict[str, Any]) -> dict[str, Any]:
 
 def merge_generate_scaling_configs_section(full: dict[str, Any]) -> dict[str, Any]:
     defaults: dict[str, Any] = {
-        "t_in_choices": [10],
-        "seeds": [101],
-        "share_to_num_epochs": {"25": 5, "50": 200, "100": 100},
+        "t_in_choices": [300], #[30, 90, 300],
+        "seeds": [101], #[101, 102, 103, 104, 105],
+        "share_to_num_epochs": {"100": 100}, #{"25": 400, "50": 200, "100": 100},
     }
     sec = full.get("generate_scaling_configs")
     if not isinstance(sec, dict):
@@ -115,7 +115,7 @@ def train_base_config_from_globals(full: dict[str, Any]) -> dict[str, Any] | Non
 
 def merge_inference_scaling_law_section(full: dict[str, Any]) -> dict[str, Any]:
     defaults = {
-        "num_sequences": 10,
+        "num_sequences": 200,
         "long_pred_length": 810,
         "n_plot_examples": 0,
     }

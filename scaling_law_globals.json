@@ -25,33 +25,21 @@
     "sequence_id_col": "sequenceId",
     "sequence_sample_base_seed": 42,
     "brain_region_sample_base_seed": 4242,
-    "subsequence_length": 360,
+    "subsequence_length": 390,
     "only_full_subsequences": true,
     "id_cols": ["sequenceId", "itemPosition"]
   },
-  "generate_scaling_configs": {
-    "t_in_choices": [10],
-    "seeds": [101],
-    "share_to_num_epochs": {
-      "25": 5,
-      "50": 200,
-      "100": 100
-    }
-  },
   "train_scaling_law": {
     "base_config": {
-      "data_path": "data_processed/data25_ba2.npy",
-      "T_in": 30,
-      "T_out": 10,
-      "n_vars": 2,
+      "T_out": 90,
       "d_model": 64,
       "n_heads": 8,
       "n_layers": 8,
       "d_ff": 128,
       "dropout": 0.05,
       "patch_len": 1,
-      "effective_batch_size": 100,
-      "batch_size": 100,
+      "effective_batch_size": 2000,
+      "batch_size": 2048,
       "accumulation_steps": 1,
       "use_mixed_precision": true,
       "loss_type": "combined",
@@ -82,10 +70,5 @@
       "use_torch_compile": true,
       "save_processed_split_examples": true
     }
-  },
-  "inference_scaling_law": {
-    "num_sequences": 10,
-    "long_pred_length": 810,
-    "n_plot_examples": 5
   }
 }

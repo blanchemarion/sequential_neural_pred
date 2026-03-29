@@ -72,6 +72,9 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 # Alternative: Use the older variable name for compatibility
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+
+python -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda)"
+
 # ---- run steps (relative paths OK because we cd'ed into PROJECT_DIR) ----
 echo "[INFO] Running pipeline..."
 time python src/prepare/prepare_data.py

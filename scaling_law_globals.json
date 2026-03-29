@@ -9,7 +9,7 @@
     "evaluation": "evaluation"
   },
   "prepare_data": {
-    "parquet_filename": "data-clean-all-2pct.parquet",
+    "parquet_filename": "data-clean-all.parquet",
     "metadata_json_filename": "data-clean-all.json",
     "npy_partitions": [
       { "name": "100", "sequence_frac": 1.0 },

@@ -128,7 +128,7 @@ def sample_brain_region_names(
 
 
 def load_parquet_data(
-    data_dir="data",
+    data_dir="data_raw",
     parquet_filename: str = "data-clean-all.parquet",
     metadata_filename: str = "data-clean-all.json",
 ):

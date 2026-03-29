@@ -25,7 +25,7 @@
     "sequence_id_col": "sequenceId",
     "sequence_sample_base_seed": 42,
     "brain_region_sample_base_seed": 4242,
-    "subsequence_length": 270,
+    "subsequence_length": 390,
     "only_full_subsequences": true,
     "id_cols": ["sequenceId", "itemPosition"]
   },

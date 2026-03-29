@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "paths": {
+    "data_raw": "data_raw",
+    "data_processed": "data_processed",
+    "configs": "configs",
+    "checkpoints": "checkpoints",
+    "predictions": "predictions",
+    "evaluation": "evaluation"
+  },
+  "prepare_data": {
+    "parquet_filename": "data-clean-all-2pct.parquet",
+    "metadata_json_filename": "data-clean-all.json",
+    "npy_partitions": [
+      { "name": "100", "sequence_frac": 1.0 },
+      { "name": "50", "sequence_frac": 0.5 },
+      { "name": "25", "sequence_frac": 0.25 }
+    ],
+    "brain_region_partitions": [
+      { "name": "2", "brain_areas": 2 },
+      { "name": "4", "brain_areas": 4 },
+      { "name": "8", "brain_areas": 8 },
+      { "name": "16", "brain_areas": 16 }
+    ],
+    "sequence_id_col": "sequenceId",
+    "sequence_sample_base_seed": 42,
+    "brain_region_sample_base_seed": 4242,
+    "subsequence_length": 360,
+    "only_full_subsequences": true,
+    "id_cols": ["sequenceId", "itemPosition"]
+  },
+  "generate_scaling_configs": {
+    "t_in_choices": [10],
+    "seeds": [101],
+    "share_to_num_epochs": {
+      "25": 5,
+      "50": 200,
+      "100": 100
+    }
+  },
+  "train_scaling_law": {
+    "base_config": {
+      "data_path": "data_processed/data25_ba2.npy",
+      "T_in": 30,
+      "T_out": 10,
+      "n_vars": 2,
+      "d_model": 64,
+      "n_heads": 8,
+      "n_layers": 8,
+      "d_ff": 128,
+      "dropout": 0.05,
+      "patch_len": 1,
+      "effective_batch_size": 100,
+      "batch_size": 100,
+      "accumulation_steps": 1,
+      "use_mixed_precision": true,
+      "loss_type": "combined",
+      "loss_mae_weight": 1.0,
+      "loss_shape_weight": 0.0,
+      "loss_deriv_weight": 0.0,
+      "loss_cross_weight": 0.0,
+      "loss_var_weight": 0.0,
+      "learning_rate": 0.0001,
+      "max_lr": 0.0003,
+      "num_epochs": 1,
+      "train_ratio": 0.8,
+      "random_seed": 101,
+      "save_dir": "checkpoints",
+      "checkpoint_flat_dir": "checkpoints",
+      "plot_dir": "evaluation",
+      "log_all_loss_terms": true,
+      "checkpoint_first_epoch": 400,
+      "checkpoint_every": 400,
+      "save_every": 400,
+      "early_stop_patience": 400,
+      "early_stop_min_delta": 1e-6,
+      "log_per_region": false,
+      "scheduler_pct_start": 0.3,
+      "scheduler_div_factor": 25,
+      "scheduler_final_div_factor": 100,
+      "scheduler_anneal_strategy": "cos",
+      "use_torch_compile": true,
+      "save_processed_split_examples": true
+    }
+  },
+  "inference_scaling_law": {
+    "num_sequences": 10,
+    "long_pred_length": 810,
+    "n_plot_examples": 5
+  }
+}

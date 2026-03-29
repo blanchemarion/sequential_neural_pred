@@ -1,9 +1,8 @@
 """
 Generate JSON run configs under configs/ for train_scaling_law.py.
 
-Combines every data_processed/*.npy with T_in in {30, 90, 300} and random_seed in
-{101..105}. num_epochs follows data share in the filename (data25→400, data50→200,
-data100→100). n_vars and region_names come from the stem (…_baK) and *_metadata.json.
+Choices for ``T_in``, seeds, and ``share_to_num_epochs`` come from ``scaling_law_globals.json``
+(override with ``--scaling-law-globals PATH``).
 """
 
 from __future__ import annotations
@@ -14,25 +13,19 @@ import re
 import sys
 from pathlib import Path
 
+_SRC = Path(__file__).resolve().parent.parent
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from helpers.scaling_law_globals import (
+    load_scaling_law_globals,
+    merge_generate_scaling_configs_section,
+    merge_paths_section,
+    resolve_repo_relative,
+    scaling_law_repo_root,
+)
+
 STEM_RE = re.compile(r"^data(?P<share>\d+)_ba(?P<nvars>\d+)$")
-
-T_IN_CHOICES = (10,) # (30, 90, 300)
-SEEDS = (101,) # (101, 102, 103, 104, 105)
-
-# data share in filename → num_epochs
-"""SHARE_TO_NUM_EPOCHS = {
-    25: 400,
-    50: 200,
-    100: 100,
-}"""
-SHARE_TO_NUM_EPOCHS = {
-    25: 5,
-}
-
-
-def project_root() -> Path:
-    """Repo root (parent of ``src/``); this file lives under ``src/prepare/``."""
-    return Path(__file__).resolve().parents[2]
 
 
 def parse_npy_stem(stem: str) -> tuple[int, int] | None:
@@ -45,12 +38,12 @@ def parse_npy_stem(stem: str) -> tuple[int, int] | None:
     return share, nvars
 
 
-def num_epochs_for_share(share: int) -> int:
-    if share not in SHARE_TO_NUM_EPOCHS:
+def num_epochs_for_share(share: int, share_to_num_epochs: dict[int, int]) -> int:
+    if share not in share_to_num_epochs:
         raise ValueError(
-            f"Unsupported data share {share} in filename (expected one of {sorted(SHARE_TO_NUM_EPOCHS)})"
+            f"Unsupported data share {share} in filename (expected one of {sorted(share_to_num_epochs)})"
         )
-    return SHARE_TO_NUM_EPOCHS[share]
+    return share_to_num_epochs[share]
 
 
 def load_region_names(metadata_path: Path) -> list[str]:
@@ -89,18 +82,24 @@ def build_config_dict(
 
 
 def main() -> None:
-    root = project_root()
+    repo = scaling_law_repo_root()
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--scaling-law-globals",
+        type=Path,
+        default=None,
+        help="Path to scaling_law_globals.json (default: <repo>/scaling_law_globals.json)",
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=root / "data_processed",
+        default=None,
         help="Directory containing .npy and matching *_metadata.json files",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=root / "configs",
+        default=None,
         help="Where to write config_*.json files",
     )
     parser.add_argument(
@@ -110,8 +109,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    data_dir = args.data_dir.resolve()
-    out_dir = args.output_dir.resolve()
+    full = load_scaling_law_globals(args.scaling_law_globals)
+    paths = merge_paths_section(full)
+    gsc = merge_generate_scaling_configs_section(full)
+    t_in_choices = tuple(gsc["t_in_choices"])
+    seeds = tuple(gsc["seeds"])
+    share_to_num_epochs: dict[int, int] = gsc["share_to_num_epochs"]
+
+    data_dir = (
+        resolve_repo_relative(repo, paths["data_processed"])
+        if args.data_dir is None
+        else Path(args.data_dir).resolve()
+    )
+    out_dir = (
+        resolve_repo_relative(repo, paths["configs"])
+        if args.output_dir is None
+        else Path(args.output_dir).resolve()
+    )
     if not data_dir.is_dir():
         print(f"[ERROR] data directory not found: {data_dir}", file=sys.stderr)
         sys.exit(1)
@@ -136,7 +150,7 @@ def main() -> None:
 
         share, n_vars_from_name = parsed
         try:
-            nepochs = num_epochs_for_share(share)
+            nepochs = num_epochs_for_share(share, share_to_num_epochs)
         except ValueError as e:
             print(f"[SKIP] {npy_path.name}: {e}")
             skipped += 1
@@ -161,10 +175,10 @@ def main() -> None:
                 f"!= n_vars from filename ({n_vars_from_name}); using filename n_vars for 'n_vars' field"
             )
 
-        data_path = relative_data_path(npy_path, root)
+        data_path = relative_data_path(npy_path, repo)
 
-        for t_in in T_IN_CHOICES:
-            for seed in SEEDS:
+        for t_in in t_in_choices:
+            for seed in seeds:
                 cfg_name = f"config_{stem}_Tin{t_in}_seed{seed}.json"
                 out_path = out_dir / cfg_name
                 payload = build_config_dict(

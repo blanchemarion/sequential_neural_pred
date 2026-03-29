@@ -37,7 +37,19 @@ from helpers.preprocess_helpers import (
     normalize_after_split_input_only,
     verify_data_loading,
 )
+from helpers.scaling_law_globals import (
+    load_scaling_law_globals,
+    merge_paths_section,
+    train_base_config_from_globals,
+)
 from models.model_KV_cached import create_model_cached
+
+_SCALING_LAW_GLOBALS_PATH: Path | None = None
+
+
+def set_scaling_law_globals_path(path: Path | None) -> None:
+    global _SCALING_LAW_GLOBALS_PATH
+    _SCALING_LAW_GLOBALS_PATH = Path(path) if path is not None else None
 
 
 # =========================
@@ -178,8 +190,8 @@ REQUIRED_SCALING_RUN_KEYS = frozenset(
 )
 
 
-def get_default_base_config() -> dict:
-    """Shared hyperparameters; per-run files override selected keys on top of this."""
+def _fallback_training_base_config() -> dict:
+    """Used only if ``scaling_law_globals.json`` has no ``train_scaling_law.base_config``."""
     return {
         "data_path": "data_processed/data25_ba2.npy",
         "T_in": 30,
@@ -223,6 +235,13 @@ def get_default_base_config() -> dict:
         "use_torch_compile": True,
         "save_processed_split_examples": True,
     }
+
+
+def get_default_base_config() -> dict:
+    """Shared hyperparameters from ``scaling_law_globals.json`` with Python fallback."""
+    full = load_scaling_law_globals(_SCALING_LAW_GLOBALS_PATH)
+    loaded = train_base_config_from_globals(full)
+    return loaded if loaded is not None else _fallback_training_base_config()
 
 
 def load_run_config_file(path: Path) -> dict:
@@ -345,7 +364,9 @@ def save_processed_split_for_inference(
 
 
 def default_scaling_configs_dir() -> Path:
-    return scaling_law_project_root() / "configs"
+    full = load_scaling_law_globals(_SCALING_LAW_GLOBALS_PATH)
+    paths = merge_paths_section(full)
+    return scaling_law_project_root() / paths["configs"]
 
 
 def discover_run_configs_in_dir(dir_path: Path) -> list[Path]:
@@ -893,10 +914,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional explicit per-run config paths (overrides configs-dir scan)",
     )
     parser.add_argument(
+        "--scaling-law-globals",
+        type=Path,
+        default=None,
+        help="Path to scaling_law_globals.json (default: <repo>/scaling_law_globals.json)",
+    )
+    parser.add_argument(
         "--configs-dir",
         type=Path,
         default=None,
-        help=f"Directory to scan for run configs (default: {default_scaling_configs_dir()})",
+        help="Directory to scan for run configs (default: from scaling_law_globals.json paths.configs)",
     )
     parser.add_argument(
         "--no-configs-dir",
@@ -911,6 +938,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     argv = argv if argv is not None else sys.argv[1:]
     args = parser.parse_args(argv)
+
+    set_scaling_law_globals_path(args.scaling_law_globals)
 
     base = get_default_base_config()
     if args.base_config is not None:

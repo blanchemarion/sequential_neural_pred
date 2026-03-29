@@ -6,9 +6,11 @@ For each ``checkpoints_*_data*_ba*_Tin*_seed*_epoch*.pt`` file, loads the matchi
 ``processed_val_seq_indices_config_{same_middle}.npy`` (logical sequence id per val row,
 required so long-horizon GT concatenates all subsequences of the same recording), and
 ``configs/config_{middle}.json`` (region names), runs long autoregressive rollouts, and
-writes ``predictions/pred_{middle}_epoch{N}.csv`` with **only** the forecast horizon
-(``LONG_PRED_LENGTH`` steps per sequence, **excluding** the initial ``T_in`` context),
-and optional PNGs with random GT vs prediction overlays (see ``--plot-examples``).
+writes ``predictions/pred_{middle}_epoch{N}.npy`` — a single float32 array of shape
+``(2, n_seq, T, V)`` where ``[0]`` is predictions and ``[1]`` is ground truth (**forecast
+only**: ``LONG_PRED_LENGTH`` steps per sequence, **excluding** the initial ``T_in`` context).
+Region order matches ``configs/config_{middle}.json`` ``region_names``.
+Optional PNGs: ``--plot-examples``.
 """
 
 from __future__ import annotations
@@ -29,17 +31,21 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
 
+from helpers.scaling_law_globals import (
+    load_scaling_law_globals,
+    merge_inference_scaling_law_section,
+    merge_paths_section,
+    resolve_repo_relative,
+)
 from models.model_KV_cached import create_model_cached
 
-
-NUM_SEQUENCES = 10
-LONG_PRED_LENGTH = 810
-N_FORECAST_EXAMPLE_PLOTS = 5
-# RNG for subsampling val rows; use run-config random_seed for reproducibility by default.
+_inf_defaults = merge_inference_scaling_law_section(load_scaling_law_globals())
+NUM_SEQUENCES = int(_inf_defaults["num_sequences"])
+LONG_PRED_LENGTH = int(_inf_defaults["long_pred_length"])
+N_FORECAST_EXAMPLE_PLOTS = int(_inf_defaults["n_plot_examples"])
 
 
 def scaling_law_project_root() -> Path:
@@ -265,14 +271,15 @@ def collect_long_predictions(
     return P[:min_n, :min_t, :min_v], G[:min_n, :min_t, :min_v]
 
 
-def save_pred_gt_csv(
+def save_pred_gt_npy(
     predictions: np.ndarray,
     ground_truth: np.ndarray,
     region_names: list[str],
     out_path: Path,
 ) -> Path:
     """
-    Columns: sequenceId, itemPosition, pred_<name1>, ..., gt_<name1>, ...
+    Write one float32 array ``(2, n_seq, T, V)``: stack[0] = pred, stack[1] = gt.
+    Channel order matches ``region_names`` (not embedded in the file).
     """
     n_seq, T, V = predictions.shape
     if ground_truth.shape != predictions.shape:
@@ -280,20 +287,13 @@ def save_pred_gt_csv(
     if len(region_names) != V:
         raise ValueError(f"region_names length {len(region_names)} != V={V}")
 
-    seq_col = np.repeat(np.arange(n_seq), T)
-    pos_col = np.tile(np.arange(T), n_seq)
-
-    data: dict[str, np.ndarray] = {
-        "sequenceId": seq_col,
-        "itemPosition": pos_col,
-    }
-    for i, name in enumerate(region_names):
-        data[f"pred_{name}"] = predictions[:, :, i].reshape(-1)
-        data[f"gt_{name}"] = ground_truth[:, :, i].reshape(-1)
-
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(data).to_csv(out_path, index=False)
+    stacked = np.stack(
+        [predictions.astype(np.float32, copy=False), ground_truth.astype(np.float32, copy=False)],
+        axis=0,
+    )
+    np.save(out_path, stacked)
     return out_path
 
 
@@ -309,7 +309,7 @@ def plot_random_forecast_examples(
     """
     Save PNGs for ``n_examples`` random sequences: per-sequence figure with one subplot per
     region (ground truth vs prediction over the forecast horizon).
-    ``output_base`` is the CSV path without suffix, e.g. .../pred_foo_epoch1
+    ``output_base`` is the prediction file path without ``.npy``, e.g. .../pred_foo_epoch1
     """
     n_seq, T, V = pred.shape
     if gt.shape != pred.shape or len(region_names) != V:
@@ -447,7 +447,7 @@ def run_one_checkpoint(
         device,
     )
 
-    # CSV: forecast only — drop initial T_in context (conditioning window).
+    # Forecast only — drop initial T_in context (conditioning window).
     t_end = min(pred_arr.shape[1], T_in + long_pred_length)
     if t_end <= T_in:
         print(f"[SKIP] Traces shorter than T_in+1: T={pred_arr.shape[1]}, T_in={T_in}")
@@ -458,9 +458,12 @@ def run_one_checkpoint(
     pred_arr = pred_arr[:, T_in:t_end, :]
     gt_arr = gt_arr[:, T_in:t_end, :]
 
-    out_csv = predictions_dir / f"pred_{middle}_epoch{epoch}.csv"
-    save_pred_gt_csv(pred_arr, gt_arr, region_names, out_csv)
-    print(f"  Wrote {out_csv}")
+    out_npy = predictions_dir / f"pred_{middle}_epoch{epoch}.npy"
+    save_pred_gt_npy(pred_arr, gt_arr, region_names, out_npy)
+    print(
+        f"  Wrote {out_npy}  shape (2, n_seq, T, V) = "
+        f"(2, {pred_arr.shape[0]}, {pred_arr.shape[1]}, {pred_arr.shape[2]})"
+    )
 
     if n_plot_examples > 0:
         plot_rng = np.random.default_rng(
@@ -470,7 +473,7 @@ def run_one_checkpoint(
             pred_arr,
             gt_arr,
             region_names,
-            out_csv.with_suffix(""),
+            out_npy.with_suffix(""),
             rng=plot_rng,
             n_examples=n_plot_examples,
         )
@@ -478,7 +481,7 @@ def run_one_checkpoint(
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return out_csv
+    return out_npy
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -490,44 +493,69 @@ def main(argv: list[str] | None = None) -> None:
         help="Folder containing checkpoints_*_epoch*.pt (default: <repo>/checkpoints)",
     )
     parser.add_argument(
+        "--scaling-law-globals",
+        type=Path,
+        default=None,
+        help="Path to scaling_law_globals.json (default: <repo>/scaling_law_globals.json)",
+    )
+    parser.add_argument(
         "--predictions-dir",
         type=Path,
         default=None,
-        help="Output CSV directory (default: <repo>/predictions)",
+        help="Output directory for .npy prediction files (default from globals paths.predictions)",
     )
     parser.add_argument(
         "--num-sequences",
         type=int,
-        default=NUM_SEQUENCES,
-        help=f"Val subsequences to evaluate (default {NUM_SEQUENCES})",
+        default=None,
+        help=f"Logical val sequences to evaluate (default: inference_scaling_law.num_sequences in globals, else {NUM_SEQUENCES})",
     )
     parser.add_argument(
         "--long-pred-length",
         type=int,
-        default=LONG_PRED_LENGTH,
-        help=f"Autoregressive steps after initial context (default {LONG_PRED_LENGTH})",
+        default=None,
+        help=f"Autoregressive steps after initial context (default from globals, else {LONG_PRED_LENGTH})",
     )
     parser.add_argument(
         "--plot-examples",
         type=int,
-        default=N_FORECAST_EXAMPLE_PLOTS,
-        help=f"Random val rows to plot (GT vs pred); 0 disables (default {N_FORECAST_EXAMPLE_PLOTS})",
+        default=None,
+        help=f"Random val rows to plot (GT vs pred); 0 disables (default from globals, else {N_FORECAST_EXAMPLE_PLOTS})",
     )
     argv = argv if argv is not None else sys.argv[1:]
     args = parser.parse_args(argv)
 
     root = scaling_law_project_root()
-    ckpt_dir = args.checkpoints_dir if args.checkpoints_dir is not None else root / "checkpoints"
-    pred_dir = args.predictions_dir if args.predictions_dir is not None else root / "predictions"
+    full = load_scaling_law_globals(args.scaling_law_globals)
+    paths = merge_paths_section(full)
+    inf = merge_inference_scaling_law_section(full)
+
+    ckpt_dir = (
+        Path(args.checkpoints_dir).resolve()
+        if args.checkpoints_dir is not None
+        else resolve_repo_relative(root, paths["checkpoints"])
+    )
+    pred_dir = (
+        Path(args.predictions_dir).resolve()
+        if args.predictions_dir is not None
+        else resolve_repo_relative(root, paths["predictions"])
+    )
+    num_sequences = args.num_sequences if args.num_sequences is not None else inf["num_sequences"]
+    long_pred_length = (
+        args.long_pred_length if args.long_pred_length is not None else inf["long_pred_length"]
+    )
+    plot_examples = (
+        args.plot_examples if args.plot_examples is not None else inf["n_plot_examples"]
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 80)
-    print("SCALING-LAW INFERENCE (saved val + per-checkpoint CSV)")
+    print("SCALING-LAW INFERENCE (saved val + per-checkpoint .npy)")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Checkpoints dir: {ckpt_dir.resolve()}")
     print(f"Predictions dir: {pred_dir.resolve()}")
-    print(f"num_sequences={args.num_sequences}  long_pred_length={args.long_pred_length}")
+    print(f"num_sequences={num_sequences}  long_pred_length={long_pred_length}")
 
     if not ckpt_dir.is_dir():
         print(f"[ERROR] Not a directory: {ckpt_dir}")
@@ -544,16 +572,16 @@ def main(argv: list[str] | None = None) -> None:
         out = run_one_checkpoint(
             p,
             device=device,
-            num_sequences=args.num_sequences,
-            long_pred_length=args.long_pred_length,
+            num_sequences=num_sequences,
+            long_pred_length=long_pred_length,
             predictions_dir=pred_dir,
-            n_plot_examples=args.plot_examples,
+            n_plot_examples=plot_examples,
         )
         if out is not None:
             ok += 1
 
     print("\n" + "=" * 80)
-    print(f"Done. Wrote {ok}/{len(ckpts)} prediction CSV(s).")
+    print(f"Done. Wrote {ok}/{len(ckpts)} prediction .npy file(s).")
     print("=" * 80)
 
 

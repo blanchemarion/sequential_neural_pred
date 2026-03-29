@@ -3,10 +3,15 @@ This script loads parquet data, explores its structure, creates visualizations,
 and exports to npy format for model building.
 
 Data Format: Wide format with sequenceId, itemPosition, and region columns
+
+Defaults and directory names are read from ``scaling_law_globals.json`` at the repo root
+(override with ``--scaling-law-globals PATH``).
 """
 
+import argparse
 import math
 import gc
+import sys
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -14,6 +19,18 @@ import json
 from pathlib import Path
 import warnings
 import seaborn as sns
+
+_SRC = Path(__file__).resolve().parent.parent
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from helpers.scaling_law_globals import (
+    load_scaling_law_globals,
+    merge_prepare_data_section,
+    merge_paths_section,
+    resolve_repo_relative,
+    scaling_law_repo_root,
+)
 
 
 PARQUET_FILENAME = "data-clean-all-2pct.parquet"
@@ -133,12 +150,17 @@ def sample_brain_region_names(
     return [all_region_cols[i] for i in pick]
 
 
-def load_parquet_data(data_dir="data", parquet_filename: str | None = None):
+def load_parquet_data(
+    data_dir="data",
+    parquet_filename: str | None = None,
+    metadata_filename: str | None = None,
+):
     """Load a single parquet file and its metadata."""
     data_dir = Path(data_dir)
     name = parquet_filename if parquet_filename is not None else PARQUET_FILENAME
+    meta_name = metadata_filename if metadata_filename is not None else "data-clean-all.json"
     parquet_path = data_dir / name
-    metadata_path = data_dir / "data-clean-all.json"
+    metadata_path = data_dir / meta_name
 
     if not parquet_path.exists():
         raise FileNotFoundError(f"{parquet_path} not found")
@@ -594,13 +616,44 @@ def export_organized_data(
 
 def main():
     """Load parquet once, then build and export one .npy per configured partition."""
+    global SEQUENCE_ID_COL, ID_COLS_DEFAULT, PARQUET_FILENAME, NPY_PARTITIONS, BRAIN_REGION_PARTITIONS
+    global SEQUENCE_SAMPLE_BASE_SEED, BRAIN_REGION_SAMPLE_BASE_SEED, SUBSEQUENCE_LENGTH, ONLY_FULL_SUBSEQUENCES
+
+    parser = argparse.ArgumentParser(description="Prepare parquet → data_processed .npy")
+    parser.add_argument(
+        "--scaling-law-globals",
+        type=Path,
+        default=None,
+        help="Path to scaling_law_globals.json (default: <repo>/scaling_law_globals.json)",
+    )
+    args = parser.parse_args()
+
+    full = load_scaling_law_globals(args.scaling_law_globals)
+    pcfg = merge_prepare_data_section(full)
+    paths = merge_paths_section(full)
+    repo = scaling_law_repo_root()
+
+    SEQUENCE_ID_COL = str(pcfg["sequence_id_col"])
+    ID_COLS_DEFAULT = tuple(str(x) for x in pcfg["id_cols"])
+    PARQUET_FILENAME = str(pcfg["parquet_filename"])
+    NPY_PARTITIONS = pcfg["npy_partitions"]
+    BRAIN_REGION_PARTITIONS = pcfg["brain_region_partitions"]
+    SEQUENCE_SAMPLE_BASE_SEED = int(pcfg["sequence_sample_base_seed"])
+    BRAIN_REGION_SAMPLE_BASE_SEED = int(pcfg["brain_region_sample_base_seed"])
+    SUBSEQUENCE_LENGTH = int(pcfg["subsequence_length"])
+    ONLY_FULL_SUBSEQUENCES = bool(pcfg["only_full_subsequences"])
+
     print("="*80)
     print("DATA PREPARATION")
     print("="*80)
 
-    output_dir = Path(OUTPUT_DIR)
-    input_dir = Path(INPUT_DIR)
-    df, metadata = load_parquet_data(input_dir)
+    output_dir = resolve_repo_relative(repo, paths["data_processed"])
+    input_dir = resolve_repo_relative(repo, paths["data_raw"])
+    df, metadata = load_parquet_data(
+        input_dir,
+        parquet_filename=PARQUET_FILENAME,
+        metadata_filename=str(pcfg["metadata_json_filename"]),
+    )
 
     if SEQUENCE_ID_COL not in df.columns:
         raise KeyError(f"Column {SEQUENCE_ID_COL!r} required for sequence-level partitions")

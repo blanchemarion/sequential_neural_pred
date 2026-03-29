@@ -847,7 +847,7 @@ def train_single_scaling_run(
         T_in=config["T_in"],
         T_out=config["T_out"],
         batch_size=config["batch_size"],
-        num_workers=4,
+        num_workers=0,
     )
 
     if training_variants is None:

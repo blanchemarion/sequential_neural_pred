@@ -81,8 +81,8 @@
     }
   },
   "inference_scaling_law": {
-    "num_sequences": 100,
+    "num_sequences": 200,
     "long_pred_length": 810,
-    "n_plot_examples": 0
+    "n_plot_examples": 1
   }
 }

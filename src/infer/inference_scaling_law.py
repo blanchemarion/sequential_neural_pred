@@ -418,15 +418,17 @@ def run_one_checkpoint(
 
     unique_seqs = np.unique(val_seq_indices)
     n_logical = int(unique_seqs.size)
-    k = min(num_sequences, n_logical)
+    n_val_rows = int(val_examples.shape[0])
+    k = min(num_sequences, n_val_rows)
     rng = np.random.default_rng(int(run_cfg.get("random_seed", 101)))
-    chosen_logical = rng.choice(unique_seqs, size=k, replace=False)
-    selected = np.array(
-        [int(np.flatnonzero(val_seq_indices == sid)[0]) for sid in chosen_logical],
-        dtype=np.int64,
-    )
+    # Sample unique val subsequence rows (not unique logical sequence ids).
+    # GT reconstruction still uses val_seq_indices + selected row start position.
+    selected = rng.choice(n_val_rows, size=k, replace=False).astype(np.int64, copy=False)
 
-    print(f"  val_seq_indices: {seq_path}  logical_sequences={n_logical}  sample_starts={k}")
+    print(
+        f"  val_seq_indices: {seq_path}  logical_sequences={n_logical}  "
+        f"val_rows={n_val_rows}  sampled_subsequences={k}"
+    )
     del _ck
     model, ckpt_cfg = create_inference_model(ckpt_path, T_in, T_out, device)
 
@@ -508,7 +510,10 @@ def main(argv: list[str] | None = None) -> None:
         "--num-sequences",
         type=int,
         default=None,
-        help=f"Logical val sequences to evaluate (default: inference_scaling_law.num_sequences in globals, else {NUM_SEQUENCES})",
+        help=(
+            f"Unique val subsequences to evaluate (default: "
+            f"inference_scaling_law.num_sequences in globals, else {NUM_SEQUENCES})"
+        ),
     )
     parser.add_argument(
         "--long-pred-length",

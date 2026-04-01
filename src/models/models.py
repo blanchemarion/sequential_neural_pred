@@ -209,84 +209,6 @@ class TransformerModel(nn.Module):
                 future_inputs.append(next_in)
 
         return torch.cat(preds, dim=1)                          # (B, T_out, n_vars)
-
-    def forward_combined(
-            self,
-            x, y,
-            p_teacher_start=1.0,
-            p_teacher_end=0.1,
-            schedule="linear",
-            noise_std=0.0,
-            detach_self=True,
-        ):
-            """
-            Two-pass scheduled sampling approximation:
-            Pass 1: oneshot-ish (future inputs = zeros) -> yhat0
-            Build shifted future inputs as mix of shifted_y and shifted_yhat0
-            Pass 2: run with mixed future inputs -> yhat (used for loss)
-
-            Cost: ~2 transformer passes (instead of T_out passes).
-            """
-            B = x.size(0)
-            device = x.device
-
-            input_tokens = self.dropout(self.in_proj(x))  # (B,T_in,d)
-
-            # ---------- Pass 1: oneshot context (all future inputs zeros) ----------
-            zeros_future = torch.zeros(B, self.T_out, self.d_model, device=device, dtype=input_tokens.dtype)
-            all_tokens_1 = torch.cat([input_tokens, zeros_future], dim=1)  # (B, T_in+T_out, d)
-
-            L = all_tokens_1.size(1)
-            all_tokens_1 = all_tokens_1 + self.pos_embedding[:, :L, :]
-
-            mask = self._local_causal_mask(L, device=device, window=self.T_in)
-            with torch.no_grad():
-                out_1 = self.transformer_encoder(all_tokens_1, mask=mask)
-                yhat0 = self.out_proj(out_1[:, self.T_in:, :])
-
-            # ---------- Build mixed shifted future inputs ----------
-            y_tokens = self.in_proj(y)          # (B,T_out,d)
-            yhat0_tokens = self.in_proj(yhat0)  # (B,T_out,d)
-
-            # Shift both (input token t is previous value)
-            shifted_y = torch.cat(
-                [torch.zeros(B, 1, self.d_model, device=device, dtype=y_tokens.dtype),
-                y_tokens[:, :-1, :]],
-                dim=1
-            )
-            shifted_yhat = torch.cat(
-                [torch.zeros(B, 1, self.d_model, device=device, dtype=yhat0_tokens.dtype),
-                yhat0_tokens[:, :-1, :]],
-                dim=1
-            )
-
-            if noise_std > 0:
-                shifted_y = shifted_y + torch.randn_like(shifted_y) * noise_std
-
-            # Per-timestep teacher probability schedule
-            if schedule == "linear":
-                t = torch.linspace(0, 1, steps=self.T_out, device=device)  # (T_out,)
-                p_teacher_t = p_teacher_start + (p_teacher_end - p_teacher_start) * t
-            else:
-                raise ValueError("Implement other schedules if needed.")
-
-            # Sample per (B, T_out) whether we use teacher at each step
-            use_teacher = (torch.rand(B, self.T_out, device=device) < p_teacher_t.view(1, -1)).float()
-            use_teacher = use_teacher.unsqueeze(-1)  # (B,T_out,1)
-
-            future_inputs = use_teacher * shifted_y + (1.0 - use_teacher) * shifted_yhat
-            future_inputs = self.dropout(future_inputs)
-
-            # ---------- Pass 2: mixed future inputs ----------
-            all_tokens_2 = torch.cat([input_tokens, future_inputs], dim=1)
-            L2 = all_tokens_2.size(1)
-            all_tokens_2 = all_tokens_2 + self.pos_embedding[:, :L2, :]
-
-            out_2 = self.transformer_encoder(all_tokens_2, mask=mask)
-            yhat = self.out_proj(out_2[:, self.T_in:, :])
-            return yhat
-     
-
     
     def count_parameters(self):
         """Count the number of trainable parameters."""
@@ -338,6 +260,7 @@ if __name__ == "__main__":
     
     # Test input
     x = torch.randn(batch_size, T_in, n_vars)
+    y = torch.randn(batch_size, T_out, n_vars)
     
     # Test one-shot forward pass
     print(f"\n{'='*60}")
@@ -348,7 +271,7 @@ if __name__ == "__main__":
     with torch.no_grad():
         import time
         start = time.time()
-        output_oneshot = model(x)
+        output_oneshot = model.forward_oneshot(x)
         elapsed_oneshot = time.time() - start
         
         print(f"  Output shape: {output_oneshot.shape}")
@@ -368,7 +291,7 @@ if __name__ == "__main__":
     
     with torch.no_grad():
         start = time.time()
-        output_autoreg = model.forward_autoregressive_old(x)
+        output_autoreg = model.forward_autoregressive(x)
         elapsed_autoreg = time.time() - start
         
         print(f"  Output shape: {output_autoreg.shape}")
@@ -377,6 +300,26 @@ if __name__ == "__main__":
         
         if output_autoreg.shape == (batch_size, T_out, n_vars):
             print("  [OK] Autoregressive inference passed!")
+        else:
+            print("  [ERROR] Shape mismatch!")
+
+    # Test teacher forcing forward pass
+    print(f"\n{'='*60}")
+    print("Testing TEACHER FORCING inference (new method)")
+    print('='*60)
+    print(f"Input shape: {x.shape}")
+    
+    with torch.no_grad():
+        start = time.time()
+        output_tf = model.forward_teacher_forcing(x, y)
+        elapsed_tf = time.time() - start
+        
+        print(f"  Output shape: {output_tf.shape}")
+        print(f"  Expected: ({batch_size}, {T_out}, {n_vars})")
+        print(f"  Time: {elapsed_tf*1000:.2f} ms ({elapsed_tf/elapsed_tf:.1f}x slower)")
+        
+        if output_tf.shape == (batch_size, T_out, n_vars):
+            print("  [OK] Teacher forcing inference passed!")
         else:
             print("  [ERROR] Shape mismatch!")
     
@@ -388,6 +331,7 @@ if __name__ == "__main__":
     print(f"  Max absolute difference: {torch.abs(output_oneshot - output_autoreg).max():.6f}")
     print(f"  One-shot output stats: mean={output_oneshot.mean():.4f}, std={output_oneshot.std():.4f}")
     print(f"  Autoregressive output stats: mean={output_autoreg.mean():.4f}, std={output_autoreg.std():.4f}")
+    print(f"  Teacher forcing output stats: mean={output_tf.mean():.4f}, std={output_tf.std():.4f}")
     
     print(f"\n{'='*60}")
     print("[OK] All tests passed!")

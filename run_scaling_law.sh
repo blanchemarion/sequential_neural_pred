@@ -63,6 +63,8 @@ else
   echo "[INFO] No requirements.txt found, skipping."
 fi
 
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
 export PYTHONUNBUFFERED=1
 
 # ---- PyTorch memory management ----
@@ -76,9 +78,9 @@ python -c "import torch; print(torch.cuda.is_available()); print(torch.version.c
 
 # ---- run steps (relative paths OK because we cd'ed into PROJECT_DIR) ----
 echo "[INFO] Running pipeline..."
-#time python src/prepare/prepare_data.py
-#time python src/prepare/generate_scaling_configs.py
-#time python src/train/train_scaling_law.py
+time python src/prepare/prepare_data.py
+time python src/prepare/generate_scaling_configs.py
+time python src/train/train_scaling_law.py
 time python src/infer/inference_scaling_law.py
 
 echo "[INFO] Done at $(date)"

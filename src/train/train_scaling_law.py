@@ -42,7 +42,8 @@ from helpers.scaling_law_globals import (
     merge_paths_section,
     train_base_config_from_globals,
 )
-from models.model_KV_cached import create_model_cached
+#from models.model_KV_cached import create_model_cached
+from models.models import create_model
 
 _SCALING_LAW_GLOBALS_PATH: Path | None = None
 
@@ -619,7 +620,18 @@ def train_single_mode(base_config, train_loader, val_loader, device, mode_tag, m
     saved_checkpoints: list[Path] = []
     print(f"[{mode_tag}] Milestone checkpoints (epochs): {milestones}")
 
-    model = create_model_cached(
+    """model = create_model_cached(
+        n_vars=config['n_vars'],
+        d_model=config['d_model'],
+        n_heads=config['n_heads'],
+        n_layers=config['n_layers'],
+        d_ff=config['d_ff'],
+        dropout=config['dropout'],
+        T_in=config['T_in'],
+        T_out=config['T_out'],
+        device=device
+    )"""
+    model = create_model(
         n_vars=config['n_vars'],
         d_model=config['d_model'],
         n_heads=config['n_heads'],
@@ -668,14 +680,23 @@ def train_single_mode(base_config, train_loader, val_loader, device, mode_tag, m
             forward_mode=mode_tag, current_p=current_p,
         )
 
-        # ---- Primary validation (matches training regime)
-        val_loss, val_comp, val_comp_raw, per_region_losses = validate(
-            model, val_loader, criterion, device,
-            compute_per_region=compute_per_region,
-            n_vars=config['n_vars'],
-            use_amp=config.get('use_mixed_precision', True),
-            forward_mode=mode_tag, current_p=current_p,
-        )
+        if mode_tag == "TF":
+            val_loss, val_comp, val_comp_raw, per_region_losses = validate(
+                model, val_loader, criterion, device,
+                compute_per_region=compute_per_region,
+                n_vars=config['n_vars'],
+                use_amp=config.get('use_mixed_precision', True),
+                forward_mode="TF", current_p=current_p,
+            )
+        else:
+            # ---- Primary validation (matches training regime)
+            val_loss, val_comp, val_comp_raw, per_region_losses = validate(
+                model, val_loader, criterion, device,
+                compute_per_region=compute_per_region,
+                n_vars=config['n_vars'],
+                use_amp=config.get('use_mixed_precision', True),
+                forward_mode=mode_tag, current_p=current_p,
+            )
 
 
         # Console prints
@@ -852,7 +873,8 @@ def train_single_scaling_run(
 
     if training_variants is None:
         training_variants = [
-            {"tag": "AR_KV", "label": "KV Autoregressive"},
+            #{"tag": "AR_KV", "label": "KV Autoregressive"},
+            {"tag": "TF", "label": "Teacher Forced"},
         ]
 
     histories = []

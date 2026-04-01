@@ -9,13 +9,17 @@
     "evaluation": "evaluation"
   },
   "prepare_data": {
-    "parquet_filename": "data-clean-all-2pct.parquet",
+    "parquet_filename": "data-clean-all.parquet",
     "metadata_json_filename": "data-clean-all.json",
     "npy_partitions": [
+      { "name": "100", "sequence_frac": 1.0 },
+      { "name": "50", "sequence_frac": 0.5 },
       { "name": "25", "sequence_frac": 0.25 }
     ],
     "brain_region_partitions": [
-      { "name": "2", "brain_areas": 2 }
+      { "name": "4", "brain_areas": 4 },
+      { "name": "8", "brain_areas": 8 },
+      { "name": "16", "brain_areas": 16 }
     ],
     "sequence_id_col": "sequenceId",
     "sequence_sample_base_seed": 42,
@@ -34,8 +38,8 @@
       "dropout": 0.05,
       "patch_len": 1,
       "effective_batch_size": 2000,
-      "batch_size": 1,
-      "accumulation_steps": 1,
+      "batch_size": 1024,
+      "accumulation_steps": 2,
       "use_mixed_precision": true,
       "loss_type": "combined",
       "loss_mae_weight": 1.0,
@@ -67,14 +71,16 @@
     }
   },
   "generate_scaling_configs": {
-    "t_in_choices": [10],
+    "t_in_choices": [30, 90, 300],
     "seeds": [101],
     "share_to_num_epochs": {
-      "25": 2
+      "25": 300,
+      "50": 200,
+      "100": 150
     }
   },
   "inference_scaling_law": {
-    "num_sequences": 2,
+    "num_sequences": 200,
     "long_pred_length": 810,
     "n_plot_examples": 1
   }

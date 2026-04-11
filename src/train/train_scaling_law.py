@@ -454,6 +454,9 @@ def run_model_forward(model, inputs, targets, current_p, mode):
     if mode == "TF":
         return model.forward_teacher_forcing(inputs, targets)
 
+    if mode == "AR":
+        return model.forward_autoregressive(inputs)
+
     raise ValueError(f"Unknown forward mode: {mode} (expected 'TL', 'AR', 'TF)")
 
 
@@ -874,7 +877,8 @@ def train_single_scaling_run(
     if training_variants is None:
         training_variants = [
             #{"tag": "AR_KV", "label": "KV Autoregressive"},
-            {"tag": "TF", "label": "Teacher Forced"},
+            #{"tag": "TF", "label": "Teacher Forced"},
+            {"tag": "AR", "label": "Autoregressive"},
         ]
 
     histories = []

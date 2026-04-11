@@ -30,7 +30,7 @@
   },
   "train_scaling_law": {
     "base_config": {
-      "T_out": 90,
+      "T_out": 1,
       "d_model": 64,
       "n_heads": 8,
       "n_layers": 8,

@@ -798,7 +798,7 @@ def main():
         'loss_var_weight': 0.0,
         'learning_rate': 1e-4,    # training_spec.lr (will use scheduler instead)
         'max_lr': 0.0003,         # scheduler.max_lr
-        'num_epochs': 50, #150 ,     # training_spec.epochs
+        'num_epochs': 150, #150 ,     # training_spec.epochs
         'train_ratio': 0.8,
         'random_seed': 101,      # seed from YAML
         'save_dir': 'checkpoints',

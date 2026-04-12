@@ -779,7 +779,7 @@ def main():
         'data_path': 'data_processed/data100_ba16.npy',
         'T_in': 90,
         'T_out': 90,
-        'n_vars': 2,
+        'n_vars': 16,
         'd_model': 64,           # model_spec.d_model
         'n_heads': 8,            # model_spec.nhead
         'n_layers': 8,           # model_spec.nlayers

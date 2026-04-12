@@ -776,7 +776,7 @@ def main():
 
     # Configuration (matching netho-hp-search-9-run-2.yaml)
     config = {
-        'data_path': 'data_processed/data25_ba2.npy',
+        'data_path': 'data_processed/data100_ba16.npy',
         'T_in': 90,
         'T_out': 90,
         'n_vars': 2,

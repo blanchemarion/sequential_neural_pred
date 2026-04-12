@@ -12,8 +12,13 @@ import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import sys
 
-from preprocess_helpers import (
+_SRC_ROOT = Path(__file__).resolve().parent.parent
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+from helpers.preprocess_helpers import (
     load_data,
     reshape_to_examples,
     split_by_sequences,
@@ -22,7 +27,7 @@ from preprocess_helpers import (
     normalize_after_split_input_only,
     verify_data_loading,
 )
-from model_AR_KV_cached import create_model_cached
+from models.model_KV_cached import create_model_cached
 
 
 # =========================
@@ -771,9 +776,9 @@ def main():
 
     # Configuration (matching netho-hp-search-9-run-2.yaml)
     config = {
-        'data_path': 'data/data25_ba2.npy',
-        'T_in': 30,
-        'T_out': 30,
+        'data_path': 'data_processed/data25_ba2.npy',
+        'T_in': 90,
+        'T_out': 90,
         'n_vars': 2,
         'd_model': 64,           # model_spec.d_model
         'n_heads': 8,            # model_spec.nhead
@@ -781,9 +786,9 @@ def main():
         'd_ff': 128,             # model_spec.d_hid (feedforward dimension)
         'dropout': 0.05,       # training_spec.dropout
         'patch_len': 1,          # Number of time-steps per patch (Timer-XL style)
-        'effective_batch_size': 1, #2000,  # Original batch size from YAML (effective via accumulation)
-        'batch_size': 1,#2048, #512,        # Physical batch size (teacher forcing is memory efficient)
-        'accumulation_steps': 1, #4,  # 64 * 32 ≈ 2048 effective batch size
+        'effective_batch_size': 2000, #2000,  # Original batch size from YAML (effective via accumulation)
+        'batch_size': 1024,#2048, #512,        # Physical batch size (teacher forcing is memory efficient)
+        'accumulation_steps': 2, #4,  # 64 * 32 ≈ 2048 effective batch size
         'use_mixed_precision': True,  # Use FP16 to reduce memory by ~50%
         'loss_type': 'combined',
         'loss_mae_weight': 1.0,
@@ -793,7 +798,7 @@ def main():
         'loss_var_weight': 0.0,
         'learning_rate': 1e-4,    # training_spec.lr (will use scheduler instead)
         'max_lr': 0.0003,         # scheduler.max_lr
-        'num_epochs': 1, #150 ,     # training_spec.epochs
+        'num_epochs': 50, #150 ,     # training_spec.epochs
         'train_ratio': 0.8,
         'random_seed': 101,      # seed from YAML
         'save_dir': 'checkpoints',
@@ -802,7 +807,7 @@ def main():
         'checkpoint_first_epoch': 5,     # <-- NEW
         'checkpoint_every': 25, 
         'save_every': 15,       # training_spec.iter_save
-        'early_stop_patience': 15, #15,  # training_spec.early_stopping_epochs
+        'early_stop_patience': 150, #15,  # training_spec.early_stopping_epochs
         'early_stop_min_delta': 1e-6,  # Minimum change to qualify as improvement
         'log_per_region': False,  # Log per-region loss breakdown
         # Scheduler parameters (OneCycleLR)
@@ -911,12 +916,8 @@ def main():
     # Train both modes sequentially
     training_variants = [
         {'tag': 'AR_KV', 'label': 'KV Autoregressive'},
-        {'tag': 'TL', 'label': 'One Shot'},
-        {'tag': 'AR', 'label': 'Autoregressive'},
-        {'tag': 'TF', 'label': 'True Teacher Forcing'},
-        #{'tag': 'AR_SSM', 'label': 'SSM Autoregressive'},
-        #{'tag': 'OS_SSM', 'label': 'SSM One Shot'},
-        #{'tag': 'TF_SSM', 'label': 'SSM Teacher Forced'},
+        #{'tag': 'AR', 'label': 'Autoregressive'},
+        {'tag': 'TF', 'label': 'Teacher Forcing'},
     ]
 
     

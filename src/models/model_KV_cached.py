@@ -185,16 +185,6 @@ class TransformerModel(nn.Module):
             )
         return pos
 
-
-    def _local_causal_additive_mask(self, L: int, device, window: int, dtype: torch.dtype):
-        """
-        SDPA additive mask: 0 for allowed, -inf for disallowed. Shape (L, L).
-        """
-        bool_mask = self._local_causal_mask(L, device=device, window=window)
-        attn_mask = torch.zeros((L, L), device=device, dtype=dtype)
-        attn_mask = attn_mask.masked_fill(bool_mask, float("-inf"))
-        return attn_mask
-
     def _run_blocks(
         self,
         x: torch.Tensor,
@@ -225,8 +215,65 @@ class TransformerModel(nn.Module):
         x = self.ln_f(x)
         return x, new_cache
 
+    def forward_teacher_forcing(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        block_offset: int = 0,
+    ) -> torch.Tensor:
+        """
+        Teacher-forced AR training (GPT-style), but for continuous values.
+
+        At future step t, the model sees ground-truth y[0],...,y[t-1] (via shifted inputs) and
+        predicts y[t]. Aligns with ``forward_autoregressive_kvcache`` at inference: same
+        embeddings, positions, causal stack, and ``future_start`` as the first future input token.
+
+        Args:
+            x: (B, T_in, n_vars)  ground-truth context / history
+            y: (B, T_out, n_vars) ground-truth future targets
+            block_offset: absolute position index of the first history token within the block
+                (same convention as ``forward_autoregressive_kvcache``).
+
+        Returns:
+            pred: (B, T_out, n_vars) predictions for each future step (aligned with y).
+        """
+        B, T_in, V = x.shape
+        B2, T_out, V2 = y.shape
+        if B != B2 or V != V2:
+            raise ValueError("x and y must match batch and n_vars")
+        if T_in != self.T_in or T_out != self.T_out:
+            raise ValueError("x/y lengths must match model T_in/T_out")
+
+        device = x.device
+
+        hist_tokens = self.in_proj(x)
+        bos = self.future_start.expand(B, 1, self.d_model).to(device=device, dtype=hist_tokens.dtype)
+
+        if T_out > 1:
+            y_shift_tokens = self.in_proj(y[:, :-1, :])
+            fut_in_tokens = torch.cat([bos, y_shift_tokens], dim=1)
+        else:
+            fut_in_tokens = bos
+
+        all_tokens = torch.cat([hist_tokens, fut_in_tokens], dim=1)
+        pos = self._positions_block_relative(all_tokens.size(1), block_offset, device=device)
+        all_tokens = all_tokens + self.pos_embedding[:, pos, :].to(dtype=all_tokens.dtype)
+        all_tokens = self.dropout(all_tokens)
+
+        out, _ = self._run_blocks(
+            all_tokens,
+            attn_mask=None,
+            is_causal=True,
+            use_cache=False,
+            cache=None,
+            window_len=None,
+        )
+        future_tokens = out[:, self.T_in :, :]
+        pred = self.out_proj(future_tokens)
+        return pred
+
     # ---------- TRAINING forward (KV-CACHED) ----------
-    def forward_autoregressive_kvcache(self, x, block_offset=0, *, use_learned_start: bool = False):
+    def forward_autoregressive_kvcache(self, x, block_offset=0, *, use_learned_start: bool = True):
         """
         KV-cached closed-loop rollout for TRAINING:
           - Prefill once on (context + start_token)
@@ -241,7 +288,7 @@ class TransformerModel(nn.Module):
         device = x.device
 
         # Embed context
-        ctx = self.in_proj(x)      # (B, T_in, d)
+        """ctx = self.in_proj(x)      # (B, T_in, d)
         ctx = self.dropout(ctx)
 
         # Start token (to predict y0)
@@ -258,6 +305,14 @@ class TransformerModel(nn.Module):
         pos0 = self._positions_block_relative(tokens0.size(1), prefill_start_pos, device=device)
         tokens0 = tokens0 + self.pos_embedding[:, pos0, :].to(dtype=tokens0.dtype)
 
+        tokens0 = self.dropout(tokens0)"""
+
+        ctx = self.in_proj(x)
+        start_tok = self.future_start.expand(B, -1, -1).to(device=device, dtype=ctx.dtype)
+
+        tokens0 = torch.cat([ctx, start_tok], dim=1)
+        pos0 = self._positions_block_relative(tokens0.size(1), block_offset, device=device)
+        tokens0 = tokens0 + self.pos_embedding[:, pos0, :].to(dtype=tokens0.dtype)
         tokens0 = self.dropout(tokens0)
 
         # Build cache list (one entry per layer)
@@ -279,17 +334,22 @@ class TransformerModel(nn.Module):
         preds = [pred]
 
         # Keep KV cache window size ~ (T_in + 1) to mimic your sliding context size
-        kv_window = self.T_in + 1
+        #kv_window = self.T_in + 1
 
         # Decode steps: each step processes ONLY the new token
         for i in range(1, self.T_out):
             # Next input token is in_proj(pred_{i-1})
-            next_tok = self.dropout(self.in_proj(pred))  # (B,1,d)
-
+            """next_tok = self.dropout(self.in_proj(pred))  # (B,1,d)
             # Add positional embedding at the absolute position
             pos_idx = block_offset + self.T_in + i  # same convention as old code
             pos = self._positions_block_relative(1, pos_idx, device=device)
+            next_tok = next_tok + self.pos_embedding[:, pos, :].to(dtype=next_tok.dtype)"""
+
+            next_tok = self.in_proj(pred)
+            pos_idx = block_offset + self.T_in + i
+            pos = self._positions_block_relative(1, pos_idx, device=device)
             next_tok = next_tok + self.pos_embedding[:, pos, :].to(dtype=next_tok.dtype)
+            next_tok = self.dropout(next_tok)
 
             # Run 1-token pass with cache, truncating KV to window
             h_new, cache = self._run_blocks(
@@ -298,7 +358,7 @@ class TransformerModel(nn.Module):
                 is_causal=False,     # q_len=1 and KV are only past+current => no future leakage
                 use_cache=True,
                 cache=cache,
-                window_len=kv_window,
+                window_len= None #kv_window,
             )
 
             pred = self.out_proj(h_new)  # (B,1,n_vars)
@@ -379,6 +439,21 @@ if __name__ == "__main__":
             print("  [OK] Autoregressive inference passed!")
         else:
             print("  [ERROR] Shape mismatch!")
+
+    # Teacher-forcing forward + backward smoke test
+    print(f"\n{'='*60}")
+    print("Testing TEACHER FORCING (train regime)")
+    print('='*60)
+    y_tgt = torch.randn(batch_size, T_out, n_vars)
+    pred_tf = model.forward_teacher_forcing(x, y_tgt)
+    print(f"  pred shape: {pred_tf.shape}")
+    if pred_tf.shape == (batch_size, T_out, n_vars):
+        print("  [OK] Teacher forcing shape passed!")
+    else:
+        print("  [ERROR] Shape mismatch!")
+    loss = F.mse_loss(pred_tf, y_tgt)
+    loss.backward()
+    print(f"  [OK] Backward pass (loss={loss.item():.6f})")
     
     # Compare outputs
     print(f"\n{'='*60}")

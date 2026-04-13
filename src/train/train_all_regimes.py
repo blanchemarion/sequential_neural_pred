@@ -778,7 +778,7 @@ def main():
     config = {
         'data_path': 'data_processed/data100_ba16.npy',
         'T_in': 90,
-        'T_out': 90,
+        'T_out': 1,
         'n_vars': 16,
         'd_model': 64,           # model_spec.d_model
         'n_heads': 8,            # model_spec.nhead
@@ -881,20 +881,39 @@ def main():
         T_out=config['T_out']
     )
     
-    train_examples, val_examples, _, _ = split_by_sequences(
+    train_examples, val_examples, train_seq_indices, val_seq_indices = split_by_sequences(
         examples, sequence_indices, 
         train_ratio=config['train_ratio'], 
         random_seed=config['random_seed']
     )
 
 
+    run_stem = (
+        f"{Path(config['data_path']).stem}"
+        f"_Tin{config['T_in']}_Tout{config['T_out']}_seed{config['random_seed']}"
+    )
+
+    proc_root = Path("data_processed")
+    proc_root.mkdir(parents=True, exist_ok=True)
+
+    stats_npy = proc_root / f"train_norm_stats_{run_stem}.npy"
+    val_npy = proc_root / f"processed_val_{run_stem}.npy"
+    val_seq_npy = proc_root / f"processed_val_seq_indices_{run_stem}.npy"
+
     train_examples, val_examples, test_examples, norm = normalize_after_split_input_only(
         train_examples,
         val_examples,
-        T_in=config['T_in'],
+        T_in=config["T_in"],
         eps=1e-6,
-        #save_stats_path="data/train_norm_stats.npy"
+        save_stats_path=str(stats_npy),   # this writes _mean/_std
     )
+
+    np.save(val_npy, val_examples)  # normalized val
+    np.save(val_seq_npy, val_seq_indices.astype(np.int64, copy=False))
+
+    config["normalization_stats_base"] = str(stats_npy.with_suffix("").resolve())
+    config["processed_val_examples_path"] = str(val_npy.resolve())
+    config["processed_val_seq_indices_path"] = str(val_seq_npy.resolve())
 
     
     # Free examples array after splitting
@@ -917,7 +936,7 @@ def main():
     training_variants = [
         {'tag': 'AR_KV', 'label': 'KV Autoregressive'},
         #{'tag': 'AR', 'label': 'Autoregressive'},
-        {'tag': 'TF', 'label': 'Teacher Forcing'},
+        #{'tag': 'TF', 'label': 'Teacher Forcing'},
     ]
 
     

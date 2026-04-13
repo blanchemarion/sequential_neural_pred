@@ -15,11 +15,13 @@ from pathlib import Path
 import random
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+import matplotlib as mpl
 import pandas as pd
 import json
 from typing import Dict, List, Tuple
 import seaborn as sns
 import torch.nn.functional as F
+import sys
 
 from itertools import combinations
 try:
@@ -28,7 +30,12 @@ except Exception as e:
     mannwhitneyu = None
     ttest_ind = None
 
-from ..helpers.preprocess_helpers import (
+
+_SRC_ROOT = Path(__file__).resolve().parent.parent
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+from helpers.preprocess_helpers import (
     load_data,
     reshape_to_examples,
     split_by_sequences,
@@ -38,12 +45,12 @@ from ..helpers.preprocess_helpers import (
 )
 
 
-from ..models.model_KV_cached import create_model_cached
-from ..models.models import create_model
+from models.model_KV_cached import create_model_cached
+from models.models import create_model
 
 NUM_SEQUENCES = 100
 SHORT_PRED_LENGTH = 90  # Fixed prediction length for short window
-LONG_PRED_LENGTH = 3960  # Fixed prediction length for long window
+LONG_PRED_LENGTH = 810  # Fixed prediction length for long window
 SEEDS = [102] #[102, 103, 104]
 
 """MODES = ["1_step", "OS", "TF", "AR"]
@@ -193,6 +200,42 @@ def load_norm_stats(stats_base_path: str):
     std  = np.load(std_path)
 
     return mean, std
+
+
+def _resolve_existing_file(path_value: str | None, repo_root: Path) -> Path | None:
+    """
+    Resolve optional checkpoint-config path to an existing file.
+    Returns None when path is missing/empty or file does not exist.
+    """
+    if not path_value:
+        return None
+    p = Path(path_value)
+    if p.is_file():
+        return p
+    if not p.is_absolute():
+        candidate = (repo_root / p).resolve()
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _build_processed_paths_from_cfg(cfg: dict, repo_root: Path) -> tuple[Path | None, Path | None]:
+    """
+    Rebuild default processed val paths using train_all_regimes run_stem convention:
+      {data_stem}_Tin{T_in}_Tout{T_out}_seed{random_seed}
+    """
+    try:
+        data_stem = Path(cfg["data_path"]).stem
+        run_stem = (
+            f"{data_stem}_Tin{int(cfg['T_in'])}_Tout{int(cfg['T_out'])}_seed{int(cfg['random_seed'])}"
+        )
+    except Exception:
+        return None, None
+
+    proc_root = repo_root / "data_processed"
+    val_p = proc_root / f"processed_val_{run_stem}.npy"
+    seq_p = proc_root / f"processed_val_seq_indices_{run_stem}.npy"
+    return val_p, seq_p
 
 
 
@@ -456,15 +499,20 @@ def evaluate_long_window(
     assert np.isfinite(gt_scored).any() and np.isfinite(predictions_scored).any()
 
 
-
 def plot_prediction_examples(
     predictions, ground_truth, output_dir, mode, window_type,
     n_examples=3, pred_start=None, seed=1
 ):
     """
     Overlay plots of predictions vs ground truth for ALL regions.
-    Prediction is hidden (transparent) before the dashed vertical line.
+    Prediction is hidden before the dashed vertical line.
+    Saves paper-ready SVG figures.
     """
+
+    # Keep text editable in SVG (useful for Inkscape)
+    mpl.rcParams["svg.fonttype"] = "none"
+    mpl.rcParams["axes.linewidth"] = 0.8
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -472,8 +520,7 @@ def plot_prediction_examples(
 
     for seq_idx in range(n_sequences):
         fig, ax = plt.subplots(
-            1, 1,
-            figsize=(6, 3) if window_type == "short" else (6, 3)
+            figsize=(7, 2.2)
         )
 
         pred_seq = predictions[seq_idx]   # (T, n_vars)
@@ -481,56 +528,80 @@ def plot_prediction_examples(
         T, n_vars = pred_seq.shape
         time_steps = np.arange(T)
 
-        # `pred_start` is the index where the model's forecast begins.
-        # For long-window eval we construct sequences as: [input_context(T_in), predicted_future...]
-        if pred_start is None:
-            pred_start = T // 2
-        pred_start = int(pred_start)
-        pred_start = max(0, min(pred_start, T))
+        # pred_start = index where forecast begins
+        this_pred_start = T // 2 if pred_start is None else int(pred_start)
+        this_pred_start = max(0, min(this_pred_start, T))
 
+        # Light grid behind traces
+        ax.grid(True, axis="y", color="#D9D9D9", linewidth=0.7, alpha=0.8)
+        ax.set_axisbelow(True)
+
+        # Forecast start marker
         ax.axvline(
-            x=pred_start,
-            color="gray",
-            linestyle="--",
-            linewidth=1,
-            alpha=0.8,
-            label="Prediction Starts"
+            x=this_pred_start,
+            color="#8C8C8C",
+            linestyle=(0, (4, 2)),
+            linewidth=1.0,
+            alpha=0.9,
+            label="Prediction start",
+            zorder=2,
         )
 
         for r in range(n_vars):
-            # --- Ground truth (full timeline) ---
+            # Ground truth over full timeline
             ax.plot(
                 time_steps,
                 gt_seq[:, r],
-                color="0.6",          # grey
+                color="#9A9A9A",
                 linewidth=1.0,
                 alpha=0.35,
-                label="Ground Truth" if r == 0 else None
+                label="Ground truth" if r == 0 else None,
+                zorder=1,
             )
 
-            # --- Prediction (ONLY after pred_start) ---
+            # Prediction only after pred_start
             y_pred = pred_seq[:, r].copy()
-            y_pred[:pred_start] = np.nan  # hides the line before prediction starts
+            y_pred[:this_pred_start] = np.nan
 
             ax.plot(
                 time_steps,
                 y_pred,
-                color="r",
-                linewidth=1.0,
-                alpha=0.35,
-                label=f"{mode} Prediction" if r == 0 else None
+                color="#2AA876",
+                linewidth=1.2,
+                alpha=0.45,
+                #label=f"{mode} prediction" if r == 0 else None,
+                label="AR prediction" if r == 0 else None,
+                zorder=3,
             )
 
-        ax.set_xlabel("Time Step", fontsize=10)
-        ax.set_ylabel("All regions", fontsize=10)
-        ax.legend(fontsize=9, loc="upper right")
+        # Labels
+        #ax.set_xlabel("Time step", fontsize=11)
+        ax.set_ylabel("All regions", fontsize=11)
+
+        # Tick styling
+        ax.tick_params(axis="both", labelsize=10)
+
+        # Cleaner legend
+        ax.legend(
+            loc="upper right",
+            frameon=True,
+            framealpha=0.95,
+            edgecolor="#CCCCCC",
+            fontsize=8,
+            handlelength=2.5,
+        )
+
+        # Slightly cleaner limits
+        ax.margins(x=0.01)
 
         plt.tight_layout()
-        output_path = output_dir / f"{window_type}_example_{mode}_seq{seq_idx+1}_seed{seed}.png"
-        plt.savefig(output_path, dpi=200, bbox_inches="tight")
-        plt.close()
+
+        output_path = output_dir / f"{window_type}_example_{mode}_seq{seq_idx+1}_seed{seed}.svg"
+        fig.savefig(output_path, format="svg")
+        plt.close(fig)
 
     print(f"  ✓ Saved {n_sequences} example plots for {mode} ({window_type})")
+
 
 
 def discover_checkpoint_pairs():
@@ -614,8 +685,9 @@ def main():
     ]"""
     SELECTED_CHECKPOINTS = [
         {
-            "config_name": "90_3960",
-            "AR_KV": "checkpoints_AR_KV_90_90",
+            "config_name": "90_810",
+            "AR_KV": "checkpoints_ar_kv_2",
+            #"TF": "checkpoints_tf_2",
         }
     ]
 
@@ -701,7 +773,7 @@ def main():
     print(f"LOADING DATA (from {pick_mode}: {first_checkpoint_path})")
     print("="*80)
 
-    checkpoint = torch.load(first_checkpoint_path, map_location=device, weights_only=False)
+    """checkpoint = torch.load(first_checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint["config"]
 
     data_array = load_data(config["data_path"])
@@ -723,7 +795,26 @@ def main():
     # --- Normalize after split 
     mean, std = load_norm_stats("data/train_norm_stats.npy")
     train_examples = apply_normalization_nct(train_examples, mean, std)
-    val_examples   = apply_normalization_nct(val_examples,   mean, std)
+    val_examples   = apply_normalization_nct(val_examples,   mean, std)"""
+
+    ckpt = torch.load(first_checkpoint_path, map_location=device, weights_only=False)
+    cfg = ckpt["config"]
+
+    repo_root = Path(__file__).resolve().parents[2]
+    val_p = _resolve_existing_file(cfg.get("processed_val_examples_path"), repo_root)
+    seq_p = _resolve_existing_file(cfg.get("processed_val_seq_indices_path"), repo_root)
+    if val_p is None or seq_p is None:
+        fallback_val_p, fallback_seq_p = _build_processed_paths_from_cfg(cfg, repo_root)
+        val_p = val_p or fallback_val_p
+        seq_p = seq_p or fallback_seq_p
+
+    if val_p is not None and seq_p is not None and val_p.is_file() and seq_p.is_file():
+        val_examples = np.load(val_p)
+        val_seq_indices = np.load(seq_p).astype(np.int64, copy=False)
+    else:
+        print(f"❌ Missing processed val array or sequence indices: {val_p}, {seq_p}")
+        print("   Expected checkpoint config fields or data_processed/processed_val_<run_stem>.npy fallback.")
+        return
 
     metadata_path = Path("data/data_organized_metadata.json")
     region_names = None
@@ -739,7 +830,7 @@ def main():
     # ------------------------------------------------------------
     base_output_dir = Path("evaluation_results")
     # Use 90_90 as the main output directory
-    main_output_dir = base_output_dir / "90_3960" #"90_90"
+    main_output_dir = base_output_dir / "90_810" #"90_90"
 
     all_results = {}
     all_results_by_seed = {}
@@ -812,12 +903,12 @@ def main():
                 if seed == SEEDS[0]:
                     all_results[config_name]["long"][mode] = long_scores
 
-                if seed == SEEDS[0] and long_scores:
+                if seed == SEEDS[0]:
                     long_pred = np.load(output_dir / f"long_predictions_{config_name}_{mode}.npy")
                     long_gt = np.load(output_dir / f"long_ground_truth_{config_name}.npy")
                     plot_prediction_examples(
                         long_pred, long_gt, output_dir, f"{config_name}_{mode}", "long",
-                        n_examples=10, pred_start=T_in, seed=seed
+                        n_examples=20, pred_start=T_in, seed=seed
                     )
 
                 del model

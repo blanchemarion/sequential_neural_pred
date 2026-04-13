@@ -50,20 +50,16 @@ from models.models import create_model
 
 NUM_SEQUENCES = 100
 SHORT_PRED_LENGTH = 90  # Fixed prediction length for short window
-LONG_PRED_LENGTH = 810  # Fixed prediction length for long window
+LONG_PRED_LENGTH = 1980  # Fixed prediction length for long window
 SEEDS = [102] #[102, 103, 104]
 
-"""MODES = ["1_step", "OS", "TF", "AR"]
-MODE_COLORS = {
-    "1_step": "#A23B72",
-    "OS": "#A23B72",      # darker magenta
-    "TF": "#C05C8A",      # lighter magenta (between OS & pink)
-    "AR": "#264653",
-}"""
-MODES = ["AR_KV"]
-MODE_COLORS = {"AR_KV": "#2E86AB"}
+
+#MODES = ["AR_KV"]
+#MODE_COLORS = {"AR_KV": "#2E86AB"}
 #MODES = ["TF"]
 #MODE_COLORS = {"TF": "#2E86AB"}
+MODES = ["1_step"]
+MODE_COLORS = {"1_step": "#2E86AB"}
 
 def load_existing_long_neurobench_runs(
     main_output_dir: Path,
@@ -566,11 +562,11 @@ def plot_prediction_examples(
             ax.plot(
                 time_steps,
                 y_pred,
-                color="#2AA876",
+                color="#7A7A7A",
                 linewidth=1.2,
                 alpha=0.45,
                 #label=f"{mode} prediction" if r == 0 else None,
-                label="AR prediction" if r == 0 else None,
+                label="1_step prediction" if r == 0 else None,
                 zorder=3,
             )
 
@@ -686,8 +682,9 @@ def main():
     SELECTED_CHECKPOINTS = [
         {
             "config_name": "90_810",
-            "AR_KV": "checkpoints_ar_kv_2",
+            #"AR_KV": "checkpoints_ar_kv_2",
             #"TF": "checkpoints_tf_2",
+            "1_step": "checkpoints_1_step",
         }
     ]
 

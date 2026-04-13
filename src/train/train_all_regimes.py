@@ -305,6 +305,16 @@ def run_model_forward(model, inputs, targets, current_p, mode):
             raise AttributeError("Model has no forward_autoregressive_kvcache()")
         return model.forward_autoregressive_kvcache(inputs)
 
+    if mode == "MIX_TF_AR_KV":
+        if not hasattr(model, "forward_teacher_forcing"):
+            raise AttributeError("Model has no forward_teacher_forcing()")
+        if not hasattr(model, "forward_autoregressive_kvcache"):
+            raise AttributeError("Model has no forward_autoregressive_kvcache()")
+        p_tf = float(np.clip(current_p, 0.0, 1.0))
+        if np.random.rand() < p_tf:
+            return model.forward_teacher_forcing(inputs, targets)
+        return model.forward_autoregressive_kvcache(inputs)
+
     if mode == "TF":
         return model.forward_teacher_forcing(inputs, targets)
 
@@ -317,7 +327,7 @@ def run_model_forward(model, inputs, targets, current_p, mode):
     if mode == "TF_SSM":
         return model.forward_teacher_forcing(inputs, targets)
 
-    raise ValueError(f"Unknown forward mode: {mode} (expected 'TL', 'AR', 'TF)")
+    raise ValueError(f"Unknown forward mode: {mode} (expected 'TL', 'AR', 'AR_KV', 'TF', 'MIX_TF_AR_KV')")
 
 
 
@@ -778,7 +788,7 @@ def main():
     config = {
         'data_path': 'data_processed/data100_ba16.npy',
         'T_in': 90,
-        'T_out': 1,
+        'T_out': 90,
         'n_vars': 16,
         'd_model': 64,           # model_spec.d_model
         'n_heads': 8,            # model_spec.nhead
@@ -934,7 +944,8 @@ def main():
     
     # Train both modes sequentially
     training_variants = [
-        {'tag': 'AR_KV', 'label': 'KV Autoregressive'},
+        #{'tag': 'AR_KV', 'label': 'KV Autoregressive'},
+        {'tag': 'MIX_TF_AR_KV', 'label': 'Mixed Teacher Forcing and Autoregressive'},
         #{'tag': 'AR', 'label': 'Autoregressive'},
         #{'tag': 'TF', 'label': 'Teacher Forcing'},
     ]

@@ -33,7 +33,7 @@ from models.model_KV_cached import create_model_cached
 # =========================
 # 1) CombinedLoss: compute components even when weights are 0 (for logging)
 # =========================
-class CombinedLoss(nn.Module):
+"""class CombinedLoss(nn.Module):
     def __init__(
         self,
         mae_weight=1.0,
@@ -159,7 +159,240 @@ def build_loss(config):
             var_weight=config.get('loss_var_weight', 0.0),
             log_all_terms=config.get('log_all_loss_terms', True),  
         )
+"""
 
+class CombinedLoss(nn.Module):
+    def __init__(
+        self,
+        mae_weight=1.0,
+        shape_weight=0.0,
+        deriv_weight=0.0,
+        cross_weight=0.0,
+        var_weight=0.0,
+        kl_weight=0.0,
+        log_all_terms: bool = True,
+        kl_bins: int = 33,
+        kl_eps: float = 1e-8,
+        kl_support_low: float = 0.001,
+        kl_support_high: float = 0.999,
+        kl_use_q10: bool = True,
+        kl_q10_weight: float = 0.5,
+    ):
+        super().__init__()
+        self.weights = {
+            'mae': mae_weight,
+            'shape': shape_weight,
+            'deriv': deriv_weight,
+            'cross': cross_weight,
+            'var': var_weight,
+            'kl': kl_weight,
+        }
+        self.log_all_terms = log_all_terms
+        self.mae = nn.L1Loss()
+
+        self.kl_bins = kl_bins
+        self.kl_eps = kl_eps
+        self.kl_support_low = kl_support_low
+        self.kl_support_high = kl_support_high
+        self.kl_use_q10 = kl_use_q10
+        self.kl_q10_weight = kl_q10_weight
+
+        self.register_buffer('running_norms', torch.ones(6))
+        self.initialized = False
+
+    def _soft_histogram_probs(self, x, lo, hi, bins, eps):
+        """
+        x: (B, T, V)
+        lo, hi: (V,)
+        returns probs: (B, V, K)
+        """
+        B, T, V = x.shape
+        device = x.device
+        dtype = x.dtype
+        K = bins
+
+        widths = (hi - lo).clamp_min(1e-6) / K
+        centers = lo.unsqueeze(-1) + (torch.arange(K, device=device, dtype=dtype) + 0.5) * widths.unsqueeze(-1)
+
+        # x -> (B, T, V, 1), centers -> (1, 1, V, K)
+        x_exp = x.unsqueeze(-1)
+        c_exp = centers.unsqueeze(0).unsqueeze(0)
+
+        sigma = 0.5 * widths
+        sigma_exp = sigma.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+
+        weights = torch.exp(-0.5 * ((x_exp - c_exp) / sigma_exp) ** 2)
+
+        probs = weights.sum(dim=1)  # (B, V, K)
+        probs = probs + eps
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        return probs
+
+    def _kl_distribution_loss(self, predictions, targets):
+        """
+        Benchmark-inspired surrogate for KL_score01_avg:
+          - per-sequence, per-region soft histograms
+          - symmetric KL
+          - similarity = 1 / (1 + KL_sym)
+          - geometric mean across regions
+          - average with lower-tail q10 over sequences
+        """
+        B, T, V = predictions.shape
+        device = predictions.device
+        dtype = predictions.dtype
+        eps = self.kl_eps
+
+        # Batch-local support; fixed dataset support would be even better if available.
+        pooled = torch.cat([targets.detach(), predictions.detach()], dim=1)  # (B, 2T, V)
+        lo = torch.quantile(pooled, self.kl_support_low, dim=(0, 1))
+        hi = torch.quantile(pooled, self.kl_support_high, dim=(0, 1))
+        hi = torch.maximum(hi, lo + 1e-6)
+
+        p = self._soft_histogram_probs(targets, lo, hi, self.kl_bins, eps)      # (B, V, K)
+        q = self._soft_histogram_probs(predictions, lo, hi, self.kl_bins, eps)  # (B, V, K)
+
+        kl_pq = (p * (torch.log(p + eps) - torch.log(q + eps))).sum(dim=-1)  # (B, V)
+        kl_qp = (q * (torch.log(q + eps) - torch.log(p + eps))).sum(dim=-1)  # (B, V)
+        kl_sym = 0.5 * (kl_pq + kl_qp)  # (B, V)
+
+        sim = 1.0 / (1.0 + kl_sym)
+        sim = sim.clamp(min=eps, max=1.0)
+
+        kl_geo_seq = torch.exp(torch.mean(torch.log(sim), dim=1))  # (B,)
+
+        kl_mean = kl_geo_seq.mean()
+        if self.kl_use_q10:
+            kl_q10 = torch.quantile(kl_geo_seq, 0.10)
+            kl_score01_avg = self.kl_q10_weight * kl_mean + (1.0 - self.kl_q10_weight) * kl_q10
+        else:
+            kl_q10 = torch.zeros((), device=device, dtype=dtype)
+            kl_score01_avg = kl_mean
+
+        kl_loss = 1.0 - kl_score01_avg
+        return kl_loss, kl_mean, kl_q10, kl_score01_avg
+
+    def forward(self, predictions, targets):
+        B, T, V = predictions.shape
+        device = predictions.device
+        dtype = predictions.dtype
+        eps = 1e-6
+
+        mae_raw = self.mae(predictions, targets)
+
+        shape_raw = torch.zeros((), device=device, dtype=dtype)
+        deriv_raw = torch.zeros((), device=device, dtype=dtype)
+        cross_raw = torch.zeros((), device=device, dtype=dtype)
+        var_raw   = torch.zeros((), device=device, dtype=dtype)
+        kl_raw    = torch.zeros((), device=device, dtype=dtype)
+
+        need_shape = (self.weights['shape'] != 0) or self.log_all_terms
+        need_deriv = (self.weights['deriv'] != 0) or self.log_all_terms
+        need_cross = (self.weights['cross'] != 0) or self.log_all_terms
+        need_var   = (self.weights['var']   != 0) or self.log_all_terms
+        need_kl    = (self.weights['kl']    != 0) or self.log_all_terms
+
+        if need_shape:
+            pred_norm = predictions - predictions.mean(dim=1, keepdim=True)
+            targ_norm = targets - targets.mean(dim=1, keepdim=True)
+            corr = (pred_norm * targ_norm).sum(dim=1) / (
+                torch.sqrt((pred_norm**2).sum(dim=1) + 1e-8) *
+                torch.sqrt((targ_norm**2).sum(dim=1) + 1e-8)
+            )
+            shape_raw = 1 - corr.mean()
+
+        if need_deriv:
+            d_pred = predictions[:, 1:, :] - predictions[:, :-1, :]
+            d_targ = targets[:, 1:, :] - targets[:, :-1, :]
+            deriv_raw = torch.mean(torch.abs(d_pred - d_targ))
+
+        if need_cross:
+            pred_cov = torch.bmm(predictions.transpose(1, 2), predictions)
+            targ_cov = torch.bmm(targets.transpose(1, 2), targets)
+            cross_raw = self.mae(pred_cov, targ_cov)
+
+        if need_var:
+            pred_ctr = predictions - predictions.mean(dim=1, keepdim=True)
+            targ_ctr = targets     - targets.mean(dim=1, keepdim=True)
+
+            bins = [0, T//3, 2*T//3, T]
+            var_terms = []
+            for a, b in zip(bins[:-1], bins[1:]):
+                ps = pred_ctr[:, a:b, :].std(dim=1, unbiased=False)
+                ts = targ_ctr[:, a:b, :].std(dim=1, unbiased=False)
+
+                log_ratio = torch.log(ps + eps) - torch.log(ts + eps)
+                under = F.relu(-log_ratio)
+                over  = F.relu(log_ratio)
+                var_terms.append(under.mean() + 0.25 * over.mean())
+
+            var_raw = torch.stack(var_terms).mean()
+
+        if need_kl:
+            kl_raw, kl_mean_raw, kl_q10_raw, kl_score01_avg_raw = self._kl_distribution_loss(predictions, targets)
+
+        if not self.initialized and self.training:
+            self.running_norms[0] = mae_raw.detach() + 1e-8
+            self.running_norms[1] = (shape_raw.detach() + 1e-8) if need_shape else torch.tensor(1.0, device=device)
+            self.running_norms[2] = (deriv_raw.detach() + 1e-8) if need_deriv else torch.tensor(1.0, device=device)
+            self.running_norms[3] = (cross_raw.detach() + 1e-8) if need_cross else torch.tensor(1.0, device=device)
+            self.running_norms[4] = (var_raw.detach()   + 1e-8) if need_var   else torch.tensor(1.0, device=device)
+            self.running_norms[5] = (kl_raw.detach()    + 1e-8) if need_kl    else torch.tensor(1.0, device=device)
+            self.initialized = True
+
+        total = self.weights['mae'] * (mae_raw / self.running_norms[0])
+        if self.weights['shape'] != 0:
+            total = total + self.weights['shape'] * (shape_raw / self.running_norms[1])
+        if self.weights['deriv'] != 0:
+            total = total + self.weights['deriv'] * (deriv_raw / self.running_norms[2])
+        if self.weights['cross'] != 0:
+            total = total + self.weights['cross'] * (cross_raw / self.running_norms[3])
+        if self.weights['var'] != 0:
+            total = total + self.weights['var'] * (var_raw / self.running_norms[4])
+        if self.weights['kl'] != 0:
+            total = total + self.weights['kl'] * (kl_raw / self.running_norms[5])
+
+        loss_dict_norm = {
+            'mae':   (mae_raw   / self.running_norms[0]),
+            'shape': (shape_raw / self.running_norms[1]) if need_shape else torch.zeros((), device=device),
+            'deriv': (deriv_raw / self.running_norms[2]) if need_deriv else torch.zeros((), device=device),
+            'cross': (cross_raw / self.running_norms[3]) if need_cross else torch.zeros((), device=device),
+            'var':   (var_raw   / self.running_norms[4]) if need_var   else torch.zeros((), device=device),
+            'kl':    (kl_raw    / self.running_norms[5]) if need_kl    else torch.zeros((), device=device),
+            'total': total
+        }
+
+        loss_dict_raw = {
+            'mae':   mae_raw,
+            'shape': shape_raw if need_shape else torch.zeros((), device=device),
+            'deriv': deriv_raw if need_deriv else torch.zeros((), device=device),
+            'cross': cross_raw if need_cross else torch.zeros((), device=device),
+            'var':   var_raw   if need_var   else torch.zeros((), device=device),
+            'kl':    kl_raw    if need_kl    else torch.zeros((), device=device),
+            'kl_mean': kl_mean_raw if need_kl else torch.zeros((), device=device),
+            'kl_q10': kl_q10_raw if need_kl else torch.zeros((), device=device),
+            'kl_score01_avg': kl_score01_avg_raw if need_kl else torch.zeros((), device=device),
+            'total': total
+        }
+
+        return total, loss_dict_norm, loss_dict_raw
+
+def build_loss(config):
+    if config['loss_type'] == 'combined':
+        return CombinedLoss(
+            mae_weight=config.get('loss_mae_weight', 1.0),
+            shape_weight=config.get('loss_shape_weight', 0.0),
+            deriv_weight=config.get('loss_deriv_weight', 0.0),
+            cross_weight=config.get('loss_cross_weight', 0.0),
+            var_weight=config.get('loss_var_weight', 0.0),
+            kl_weight=config.get('loss_kl_weight', 0.1),
+            log_all_terms=config.get('log_all_loss_terms', True),
+            kl_bins=config.get('loss_kl_bins', 33),
+            kl_eps=config.get('loss_kl_eps', 1e-8),
+            kl_support_low=config.get('loss_kl_support_low', 0.001),
+            kl_support_high=config.get('loss_kl_support_high', 0.999),
+            kl_use_q10=config.get('loss_kl_use_q10', True),
+            kl_q10_weight=config.get('loss_kl_q10_weight', 0.5),
+        )
     
 def plot_learning_curves(train_history, val_history, save_dir):
     if len(train_history) == 0 or len(val_history) == 0:
@@ -945,9 +1178,9 @@ def main():
     # Train both modes sequentially
     training_variants = [
         #{'tag': 'AR_KV', 'label': 'KV Autoregressive'},
-        {'tag': 'MIX_TF_AR_KV', 'label': 'Mixed Teacher Forcing and Autoregressive'},
+        #{'tag': 'MIX_TF_AR_KV', 'label': 'Mixed Teacher Forcing and Autoregressive'},
         #{'tag': 'AR', 'label': 'Autoregressive'},
-        #{'tag': 'TF', 'label': 'Teacher Forcing'},
+        {'tag': 'TF', 'label': 'Teacher Forcing'},
     ]
 
     

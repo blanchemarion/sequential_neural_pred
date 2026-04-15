@@ -262,7 +262,8 @@ class CombinedLoss(nn.Module):
         eps = self.kl_eps
 
         pooled = torch.cat([targets.detach(), predictions.detach()], dim=1)  # (B, 2T, V)
-        pooled_flat = pooled.reshape(-1, V)
+        # quantile requires float/double input; autocast can make activations float16.
+        pooled_flat = pooled.reshape(-1, V).float()
         lo = torch.quantile(pooled_flat, self.kl_support_low, dim=0)
         hi = torch.quantile(pooled_flat, self.kl_support_high, dim=0)
         hi = torch.maximum(hi, lo + 1e-6)
@@ -281,7 +282,7 @@ class CombinedLoss(nn.Module):
 
         kl_mean = kl_geo_seq.mean()
         if self.kl_use_q10:
-            kl_q10 = torch.quantile(kl_geo_seq, 0.10)
+            kl_q10 = torch.quantile(kl_geo_seq.float(), 0.10)
             kl_score01_avg = self.kl_q10_weight * kl_mean + (1.0 - self.kl_q10_weight) * kl_q10
         else:
             kl_q10 = torch.zeros((), device=device, dtype=dtype)
@@ -308,17 +309,18 @@ class CombinedLoss(nn.Module):
         dtype = predictions.dtype
         eps = self.qnt_eps
 
+        # Quantile ops require float/double input; autocast can make tensors float16.
+        targets_f = targets.float()
+        predictions_f = predictions.float()
+
         # Quantile grid
         quantiles = torch.linspace(
             self.qnt_q_lo,
             self.qnt_q_hi,
             self.qnt_n_q,
             device=device,
-            dtype=dtype,
+            dtype=targets_f.dtype,
         )  # (Q,)
-        # torch.quantile requires tensor q to have the same dtype as input.
-        quantiles_t = quantiles.to(dtype=targets.dtype)
-        quantiles_p = quantiles.to(dtype=predictions.dtype)
 
         tail_mask = (quantiles <= self.qnt_tail_lo) | (quantiles >= self.qnt_tail_hi)  # (Q,)
         tail_idx = torch.where(tail_mask)[0]
@@ -326,14 +328,14 @@ class CombinedLoss(nn.Module):
             raise ValueError("QNT tail mask is empty. Check qnt_tail_lo/qnt_tail_hi settings.")
 
         # GT-only scale per region, across batch+time
-        targ_flat = targets.reshape(-1, V)  # (B*T, V)
+        targ_flat = targets_f.reshape(-1, V)  # (B*T, V)
         q25 = torch.quantile(targ_flat, 0.25, dim=0)
         q75 = torch.quantile(targ_flat, 0.75, dim=0)
         iqr_gt = (q75 - q25).clamp_min(eps)  # (V,)
 
         # Per-sequence, per-region, per-quantile
-        q_gt = torch.quantile(targets, quantiles_t, dim=1)       # (Q, B, V)
-        q_pr = torch.quantile(predictions, quantiles_p, dim=1)   # (Q, B, V)
+        q_gt = torch.quantile(targets_f, quantiles, dim=1)       # (Q, B, V)
+        q_pr = torch.quantile(predictions_f, quantiles, dim=1)   # (Q, B, V)
 
         q_gt = q_gt.permute(1, 2, 0)  # (B, V, Q)
         q_pr = q_pr.permute(1, 2, 0)  # (B, V, Q)

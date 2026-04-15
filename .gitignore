@@ -16,4 +16,4 @@ checkpoints_1_step/
 evaluation_results/
 checkpoints_VAR_BASELINE_90_90/
 checkpoints_mix_tf_ar/
-checkpoints_AR_KV_90_90/
+checkpoints_TF_KL_0.1/

@@ -244,8 +244,9 @@ class CombinedLoss(nn.Module):
 
         # Batch-local support; fixed dataset support would be even better if available.
         pooled = torch.cat([targets.detach(), predictions.detach()], dim=1)  # (B, 2T, V)
-        lo = torch.quantile(pooled, self.kl_support_low, dim=(0, 1))
-        hi = torch.quantile(pooled, self.kl_support_high, dim=(0, 1))
+        pooled_flat = pooled.reshape(-1, V)  # collapse batch+time, keep variable axis
+        lo = torch.quantile(pooled_flat, self.kl_support_low, dim=0)
+        hi = torch.quantile(pooled_flat, self.kl_support_high, dim=0)
         hi = torch.maximum(hi, lo + 1e-6)
 
         p = self._soft_histogram_probs(targets, lo, hi, self.kl_bins, eps)      # (B, V, K)

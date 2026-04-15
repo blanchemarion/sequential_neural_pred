@@ -316,6 +316,9 @@ class CombinedLoss(nn.Module):
             device=device,
             dtype=dtype,
         )  # (Q,)
+        # torch.quantile requires tensor q to have the same dtype as input.
+        quantiles_t = quantiles.to(dtype=targets.dtype)
+        quantiles_p = quantiles.to(dtype=predictions.dtype)
 
         tail_mask = (quantiles <= self.qnt_tail_lo) | (quantiles >= self.qnt_tail_hi)  # (Q,)
         tail_idx = torch.where(tail_mask)[0]
@@ -329,8 +332,8 @@ class CombinedLoss(nn.Module):
         iqr_gt = (q75 - q25).clamp_min(eps)  # (V,)
 
         # Per-sequence, per-region, per-quantile
-        q_gt = torch.quantile(targets, quantiles, dim=1)       # (Q, B, V)
-        q_pr = torch.quantile(predictions, quantiles, dim=1)   # (Q, B, V)
+        q_gt = torch.quantile(targets, quantiles_t, dim=1)       # (Q, B, V)
+        q_pr = torch.quantile(predictions, quantiles_p, dim=1)   # (Q, B, V)
 
         q_gt = q_gt.permute(1, 2, 0)  # (B, V, Q)
         q_pr = q_pr.permute(1, 2, 0)  # (B, V, Q)

@@ -48,20 +48,20 @@ from helpers.preprocess_helpers import (
 from models.model_KV_cached import create_model_cached
 from models.models import create_model
 
-NUM_SEQUENCES = 222
+NUM_SEQUENCES = 20
 SHORT_PRED_LENGTH = 90  # Fixed prediction length for short window
 LONG_PRED_LENGTH = 720  # Fixed prediction length for long window
 SEEDS = [102] #[102, 103, 104]
 
 
-MODES = ["AR_KV"]
-MODE_COLORS = {"AR_KV": "#2E86AB"}
+#MODES = ["AR_KV"]
+#MODE_COLORS = {"AR_KV": "#2E86AB"}
 #MODES = ["TF"]
 #MODE_COLORS = {"TF": "#2E86AB"}
 #MODES = ["1_step"]
 #MODE_COLORS = {"1_step": "#2E86AB"}
-#MODES = ["MIX_TF_AR_KV"]
-#MODE_COLORS = {"MIX_TF_AR_KV": "#2E86AB"}
+MODES = ["TF_KL_0.1"]
+MODE_COLORS = {"TF_KL_0.1": "#2E86AB"}
 
 def load_existing_long_neurobench_runs(
     main_output_dir: Path,
@@ -684,8 +684,9 @@ def main():
     SELECTED_CHECKPOINTS = [
         {
             "config_name": "90_810",
-            "AR_KV": "checkpoints_ar_kv_2",
+            #"AR_KV": "checkpoints_ar_kv_2",
             #"TF": "checkpoints_tf_2",
+            "TF_KL_0.1": "checkpoints_TF_KL_0.1",
             #"MIX_TF_AR_KV": "checkpoints_mix_tf_ar",
             #"1_step": "checkpoints_1_step",
         }
@@ -908,7 +909,7 @@ def main():
                     long_gt = np.load(output_dir / f"long_ground_truth_{config_name}.npy")
                     plot_prediction_examples(
                         long_pred, long_gt, output_dir, f"{config_name}_{mode}", "long",
-                        n_examples=0, pred_start=T_in, seed=seed
+                        n_examples=20, pred_start=T_in, seed=seed
                     )
 
                 del model

@@ -60,8 +60,8 @@ SEEDS = [102] #[102, 103, 104]
 #MODE_COLORS = {"TF": "#2E86AB"}
 #MODES = ["1_step"]
 #MODE_COLORS = {"1_step": "#2E86AB"}
-MODES = ["TF_KL_0.1"]
-MODE_COLORS = {"TF_KL_0.1": "#2E86AB"}
+MODES = ["TF_QTL_0.1"]
+MODE_COLORS = {"TF_QTL_0.1": "#2E86AB"}
 
 def load_existing_long_neurobench_runs(
     main_output_dir: Path,
@@ -686,7 +686,7 @@ def main():
             "config_name": "90_810",
             #"AR_KV": "checkpoints_ar_kv_2",
             #"TF": "checkpoints_tf_2",
-            "TF_KL_0.1": "checkpoints_TF_KL_0.1",
+            "TF_QTL_0.1": "checkpoints_TF_QTL_0.1",
             #"MIX_TF_AR_KV": "checkpoints_mix_tf_ar",
             #"1_step": "checkpoints_1_step",
         }

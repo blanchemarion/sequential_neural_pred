@@ -487,7 +487,7 @@ def build_loss(config):
             deriv_weight=config.get('loss_deriv_weight', 0.0),
             cross_weight=config.get('loss_cross_weight', 0.0),
             var_weight=config.get('loss_var_weight', 0.0),
-            kl_weight=config.get('loss_kl_weight', 0.0),
+            kl_weight=config.get('loss_kl_weight', 0.02),
             qnt_weight=config.get('loss_qnt_weight', 0.08),
             log_all_terms=config.get('log_all_loss_terms', True),
             kl_bins=config.get('loss_kl_bins', 33),

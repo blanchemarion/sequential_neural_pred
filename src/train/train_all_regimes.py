@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import sys
 import math
 
+
 _SRC_ROOT = Path(__file__).resolve().parent.parent
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
@@ -172,6 +173,7 @@ class CombinedLoss(nn.Module):
         var_weight=0.0,
         kl_weight=0.0,
         qnt_weight=0.0,
+        mom_weight=0.0,
         log_all_terms: bool = True,
         kl_bins: int = 33,
         kl_eps: float = 1e-8,
@@ -186,6 +188,10 @@ class CombinedLoss(nn.Module):
         qnt_tail_hi: float = 0.90,
         qnt_top_q_regions: float = 0.25,
         qnt_eps: float = 1e-8,
+        mom_eps: float = 1e-8,
+        mom_var_log_weight: float = 1.0,
+        mom_skew_weight: float = 0.50,
+        mom_kurt_weight: float = 0.25,
     ):
         super().__init__()
         self.weights = {
@@ -196,6 +202,7 @@ class CombinedLoss(nn.Module):
             'var': var_weight,
             'kl': kl_weight,
             'qnt': qnt_weight,
+            'mom': mom_weight,
         }
         self.log_all_terms = log_all_terms
         self.mae = nn.L1Loss()
@@ -217,8 +224,14 @@ class CombinedLoss(nn.Module):
         self.qnt_top_q_regions = qnt_top_q_regions
         self.qnt_eps = qnt_eps
 
-        # mae, shape, deriv, cross, var, kl, qnt
-        self.register_buffer('running_norms', torch.ones(7))
+        # MOM params
+        self.mom_eps = mom_eps
+        self.mom_var_log_weight = mom_var_log_weight
+        self.mom_skew_weight = mom_skew_weight
+        self.mom_kurt_weight = mom_kurt_weight
+
+        # mae, shape, deriv, cross, var, kl, qnt, mom
+        self.register_buffer('running_norms', torch.ones(8))
         self.initialized = False
 
     def _soft_histogram_probs(self, x, lo, hi, bins, eps):
@@ -236,14 +249,14 @@ class CombinedLoss(nn.Module):
         widths = (hi - lo).clamp_min(1e-6) / K
         centers = lo.unsqueeze(-1) + (torch.arange(K, device=device, dtype=dtype) + 0.5) * widths.unsqueeze(-1)
 
-        x_exp = x.unsqueeze(-1)                                 # (B, T, V, 1)
-        c_exp = centers.unsqueeze(0).unsqueeze(0)              # (1, 1, V, K)
+        x_exp = x.unsqueeze(-1)                    # (B, T, V, 1)
+        c_exp = centers.unsqueeze(0).unsqueeze(0) # (1, 1, V, K)
 
         sigma = 0.5 * widths
         sigma_exp = sigma.unsqueeze(0).unsqueeze(0).unsqueeze(-1)  # (1, 1, V, 1)
 
         weights = torch.exp(-0.5 * ((x_exp - c_exp) / sigma_exp) ** 2)
-        probs = weights.sum(dim=1)                             # (B, V, K)
+        probs = weights.sum(dim=1)  # (B, V, K)
         probs = probs + eps
         probs = probs / probs.sum(dim=-1, keepdim=True)
         return probs
@@ -263,17 +276,16 @@ class CombinedLoss(nn.Module):
         eps = self.kl_eps
 
         pooled = torch.cat([targets.detach(), predictions.detach()], dim=1)  # (B, 2T, V)
-        # quantile requires float/double input; autocast can make activations float16.
         pooled_flat = pooled.reshape(-1, V).float()
         lo = torch.quantile(pooled_flat, self.kl_support_low, dim=0)
         hi = torch.quantile(pooled_flat, self.kl_support_high, dim=0)
         hi = torch.maximum(hi, lo + 1e-6)
 
-        p = self._soft_histogram_probs(targets, lo, hi, self.kl_bins, eps)      # (B, V, K)
-        q = self._soft_histogram_probs(predictions, lo, hi, self.kl_bins, eps)  # (B, V, K)
+        p = self._soft_histogram_probs(targets, lo.to(dtype), hi.to(dtype), self.kl_bins, eps)
+        q = self._soft_histogram_probs(predictions, lo.to(dtype), hi.to(dtype), self.kl_bins, eps)
 
-        kl_pq = (p * (torch.log(p + eps) - torch.log(q + eps))).sum(dim=-1)     # (B, V)
-        kl_qp = (q * (torch.log(q + eps) - torch.log(p + eps))).sum(dim=-1)     # (B, V)
+        kl_pq = (p * (torch.log(p + eps) - torch.log(q + eps))).sum(dim=-1)  # (B, V)
+        kl_qp = (q * (torch.log(q + eps) - torch.log(p + eps))).sum(dim=-1)  # (B, V)
         kl_sym = 0.5 * (kl_pq + kl_qp)
 
         sim = 1.0 / (1.0 + kl_sym)
@@ -283,7 +295,7 @@ class CombinedLoss(nn.Module):
 
         kl_mean = kl_geo_seq.mean()
         if self.kl_use_q10:
-            kl_q10 = torch.quantile(kl_geo_seq.float(), 0.10)
+            kl_q10 = torch.quantile(kl_geo_seq.float(), 0.10).to(dtype)
             kl_score01_avg = self.kl_q10_weight * kl_mean + (1.0 - self.kl_q10_weight) * kl_q10
         else:
             kl_q10 = torch.zeros((), device=device, dtype=dtype)
@@ -295,7 +307,6 @@ class CombinedLoss(nn.Module):
     def _qnt_distribution_loss(self, predictions, targets):
         """
         Benchmark-inspired surrogate for QNT_score01:
-
           Q_gt(b,v,q) = quantile_q of targets[b,:,v]
           Q_pr(b,v,q) = quantile_q of preds[b,:,v]
           d_tail(b,v) = mean over tail quantiles of |Q_gt - Q_pr| / (IQR_GT(v) + eps)
@@ -310,50 +321,120 @@ class CombinedLoss(nn.Module):
         dtype = predictions.dtype
         eps = self.qnt_eps
 
-        # Quantile ops require float/double input; autocast can make tensors float16.
         targets_f = targets.float()
         predictions_f = predictions.float()
 
-        # Quantile grid
         quantiles = torch.linspace(
             self.qnt_q_lo,
             self.qnt_q_hi,
             self.qnt_n_q,
             device=device,
             dtype=targets_f.dtype,
-        )  # (Q,)
+        )
 
-        tail_mask = (quantiles <= self.qnt_tail_lo) | (quantiles >= self.qnt_tail_hi)  # (Q,)
+        tail_mask = (quantiles <= self.qnt_tail_lo) | (quantiles >= self.qnt_tail_hi)
         tail_idx = torch.where(tail_mask)[0]
         if tail_idx.numel() == 0:
             raise ValueError("QNT tail mask is empty. Check qnt_tail_lo/qnt_tail_hi settings.")
 
-        # GT-only scale per region, across batch+time
-        targ_flat = targets_f.reshape(-1, V)  # (B*T, V)
+        targ_flat = targets_f.reshape(-1, V)
         q25 = torch.quantile(targ_flat, 0.25, dim=0)
         q75 = torch.quantile(targ_flat, 0.75, dim=0)
-        iqr_gt = (q75 - q25).clamp_min(eps)  # (V,)
+        iqr_gt = (q75 - q25).clamp_min(eps)
 
-        # Per-sequence, per-region, per-quantile
-        q_gt = torch.quantile(targets_f, quantiles, dim=1)       # (Q, B, V)
-        q_pr = torch.quantile(predictions_f, quantiles, dim=1)   # (Q, B, V)
+        q_gt = torch.quantile(targets_f, quantiles, dim=1)      # (Q, B, V)
+        q_pr = torch.quantile(predictions_f, quantiles, dim=1)  # (Q, B, V)
 
         q_gt = q_gt.permute(1, 2, 0)  # (B, V, Q)
         q_pr = q_pr.permute(1, 2, 0)  # (B, V, Q)
 
-        dq = torch.abs(q_gt - q_pr) / iqr_gt.view(1, V, 1)     # (B, V, Q)
-        d_tail = dq[:, :, tail_idx].mean(dim=-1)               # (B, V)
+        dq = torch.abs(q_gt - q_pr) / iqr_gt.view(1, V, 1)
+        d_tail = dq[:, :, tail_idx].mean(dim=-1)  # (B, V)
 
-        # Per-sequence strict distance: mean of top-q largest region errors
         k = max(1, int(math.ceil(self.qnt_top_q_regions * V)))
-        topk_vals, _ = torch.topk(d_tail, k=k, dim=1, largest=True, sorted=False)  # (B, k)
-        D_seq = topk_vals.mean(dim=1)                           # (B,)
+        topk_vals, _ = torch.topk(d_tail, k=k, dim=1, largest=True, sorted=False)
+        D_seq = topk_vals.mean(dim=1)  # (B,)
 
         D = D_seq.mean()
         qnt_score01 = 1.0 / (1.0 + D)
         qnt_loss = 1.0 - qnt_score01
 
         return qnt_loss, D, qnt_score01, D_seq, d_tail
+
+    def _moment_distribution_loss(self, predictions, targets):
+        """
+        Benchmark-inspired surrogate for MOM_score01.
+
+        For each region v, flatten over batch and time:
+          dist_v = |log(var_p / var_g)|
+                   + 0.50 * |skew_p - skew_g|
+                   + 0.25 * |kurt_p - kurt_g|
+
+          score_v = 1 / (1 + dist_v)
+          MOM_score01 = mean_v score_v
+
+        Loss = 1 - MOM_score01
+        """
+        device = predictions.device
+        dtype = predictions.dtype
+        eps = self.mom_eps
+
+        pred_f = predictions.float()
+        targ_f = targets.float()
+
+        # Flatten batch and time, preserve variable axis
+        pred_flat = pred_f.reshape(-1, pred_f.shape[-1])  # (B*T, V)
+        targ_flat = targ_f.reshape(-1, targ_f.shape[-1])  # (B*T, V)
+
+        # Means
+        mu_p = pred_flat.mean(dim=0)
+        mu_g = targ_flat.mean(dim=0)
+
+        # Centered
+        cp = pred_flat - mu_p.unsqueeze(0)
+        cg = targ_flat - mu_g.unsqueeze(0)
+
+        # Variances
+        var_p = cp.pow(2).mean(dim=0).clamp_min(eps)
+        var_g = cg.pow(2).mean(dim=0).clamp_min(eps)
+
+        std_p = torch.sqrt(var_p)
+        std_g = torch.sqrt(var_g)
+
+        # Standardized variables
+        zp = cp / std_p.unsqueeze(0)
+        zg = cg / std_g.unsqueeze(0)
+
+        # Skewness and excess kurtosis
+        skew_p = zp.pow(3).mean(dim=0)
+        skew_g = zg.pow(3).mean(dim=0)
+
+        kurt_p = zp.pow(4).mean(dim=0) - 3.0
+        kurt_g = zg.pow(4).mean(dim=0) - 3.0
+
+        dist = (
+            self.mom_var_log_weight * torch.abs(torch.log(var_p) - torch.log(var_g))
+            + self.mom_skew_weight * torch.abs(skew_p - skew_g)
+            + self.mom_kurt_weight * torch.abs(kurt_p - kurt_g)
+        )  # (V,)
+
+        mom_region_score = 1.0 / (1.0 + dist)
+        mom_score01 = mom_region_score.mean()
+        mom_loss = 1.0 - mom_score01
+
+        # Useful raw diagnostics
+        mom_var_term = torch.abs(torch.log(var_p) - torch.log(var_g)).mean().to(dtype)
+        mom_skew_term = torch.abs(skew_p - skew_g).mean().to(dtype)
+        mom_kurt_term = torch.abs(kurt_p - kurt_g).mean().to(dtype)
+
+        return (
+            mom_loss.to(dtype),
+            mom_score01.to(dtype),
+            mom_region_score.to(dtype),
+            mom_var_term,
+            mom_skew_term,
+            mom_kurt_term,
+        )
 
     def forward(self, predictions, targets):
         B, T, V = predictions.shape
@@ -369,6 +450,7 @@ class CombinedLoss(nn.Module):
         var_raw   = torch.zeros((), device=device, dtype=dtype)
         kl_raw    = torch.zeros((), device=device, dtype=dtype)
         qnt_raw   = torch.zeros((), device=device, dtype=dtype)
+        mom_raw   = torch.zeros((), device=device, dtype=dtype)
 
         kl_mean_raw = torch.zeros((), device=device, dtype=dtype)
         kl_q10_raw = torch.zeros((), device=device, dtype=dtype)
@@ -377,12 +459,18 @@ class CombinedLoss(nn.Module):
         qnt_D_raw = torch.zeros((), device=device, dtype=dtype)
         qnt_score01_raw = torch.zeros((), device=device, dtype=dtype)
 
+        mom_score01_raw = torch.zeros((), device=device, dtype=dtype)
+        mom_var_term_raw = torch.zeros((), device=device, dtype=dtype)
+        mom_skew_term_raw = torch.zeros((), device=device, dtype=dtype)
+        mom_kurt_term_raw = torch.zeros((), device=device, dtype=dtype)
+
         need_shape = (self.weights['shape'] != 0) or self.log_all_terms
         need_deriv = (self.weights['deriv'] != 0) or self.log_all_terms
         need_cross = (self.weights['cross'] != 0) or self.log_all_terms
         need_var   = (self.weights['var']   != 0) or self.log_all_terms
         need_kl    = (self.weights['kl']    != 0) or self.log_all_terms
         need_qnt   = (self.weights['qnt']   != 0) or self.log_all_terms
+        need_mom   = (self.weights['mom']   != 0) or self.log_all_terms
 
         if need_shape:
             pred_norm = predictions - predictions.mean(dim=1, keepdim=True)
@@ -426,6 +514,16 @@ class CombinedLoss(nn.Module):
         if need_qnt:
             qnt_raw, qnt_D_raw, qnt_score01_raw, _, _ = self._qnt_distribution_loss(predictions, targets)
 
+        if need_mom:
+            (
+                mom_raw,
+                mom_score01_raw,
+                _,
+                mom_var_term_raw,
+                mom_skew_term_raw,
+                mom_kurt_term_raw,
+            ) = self._moment_distribution_loss(predictions, targets)
+
         if not self.initialized and self.training:
             self.running_norms[0] = mae_raw.detach() + 1e-8
             self.running_norms[1] = (shape_raw.detach() + 1e-8) if need_shape else torch.tensor(1.0, device=device)
@@ -434,6 +532,7 @@ class CombinedLoss(nn.Module):
             self.running_norms[4] = (var_raw.detach()   + 1e-8) if need_var   else torch.tensor(1.0, device=device)
             self.running_norms[5] = (kl_raw.detach()    + 1e-8) if need_kl    else torch.tensor(1.0, device=device)
             self.running_norms[6] = (qnt_raw.detach()   + 1e-8) if need_qnt   else torch.tensor(1.0, device=device)
+            self.running_norms[7] = (mom_raw.detach()   + 1e-8) if need_mom   else torch.tensor(1.0, device=device)
             self.initialized = True
 
         total = self.weights['mae'] * (mae_raw / self.running_norms[0])
@@ -449,6 +548,8 @@ class CombinedLoss(nn.Module):
             total = total + self.weights['kl'] * (kl_raw / self.running_norms[5])
         if self.weights['qnt'] != 0:
             total = total + self.weights['qnt'] * (qnt_raw / self.running_norms[6])
+        if self.weights['mom'] != 0:
+            total = total + self.weights['mom'] * (mom_raw / self.running_norms[7])
 
         loss_dict_norm = {
             'mae':   (mae_raw   / self.running_norms[0]),
@@ -458,26 +559,37 @@ class CombinedLoss(nn.Module):
             'var':   (var_raw   / self.running_norms[4]) if need_var   else torch.zeros((), device=device),
             'kl':    (kl_raw    / self.running_norms[5]) if need_kl    else torch.zeros((), device=device),
             'qnt':   (qnt_raw   / self.running_norms[6]) if need_qnt   else torch.zeros((), device=device),
+            'mom':   (mom_raw   / self.running_norms[7]) if need_mom   else torch.zeros((), device=device),
             'total': total
         }
 
         loss_dict_raw = {
-            'mae':   mae_raw,
+            'mae': mae_raw,
             'shape': shape_raw if need_shape else torch.zeros((), device=device),
             'deriv': deriv_raw if need_deriv else torch.zeros((), device=device),
             'cross': cross_raw if need_cross else torch.zeros((), device=device),
-            'var':   var_raw   if need_var   else torch.zeros((), device=device),
-            'kl':    kl_raw    if need_kl    else torch.zeros((), device=device),
+            'var': var_raw if need_var else torch.zeros((), device=device),
+
+            'kl': kl_raw if need_kl else torch.zeros((), device=device),
             'kl_mean': kl_mean_raw if need_kl else torch.zeros((), device=device),
             'kl_q10': kl_q10_raw if need_kl else torch.zeros((), device=device),
             'kl_score01_avg': kl_score01_avg_raw if need_kl else torch.zeros((), device=device),
+
             'qnt': qnt_raw if need_qnt else torch.zeros((), device=device),
             'qnt_D': qnt_D_raw if need_qnt else torch.zeros((), device=device),
             'qnt_score01': qnt_score01_raw if need_qnt else torch.zeros((), device=device),
-            'total': total
+
+            'mom': mom_raw if need_mom else torch.zeros((), device=device),
+            'mom_score01': mom_score01_raw if need_mom else torch.zeros((), device=device),
+            'mom_var_term': mom_var_term_raw if need_mom else torch.zeros((), device=device),
+            'mom_skew_term': mom_skew_term_raw if need_mom else torch.zeros((), device=device),
+            'mom_kurt_term': mom_kurt_term_raw if need_mom else torch.zeros((), device=device),
+
+            'total': total,
         }
 
         return total, loss_dict_norm, loss_dict_raw
+
 
 def build_loss(config):
     if config['loss_type'] == 'combined':
@@ -487,15 +599,20 @@ def build_loss(config):
             deriv_weight=config.get('loss_deriv_weight', 0.0),
             cross_weight=config.get('loss_cross_weight', 0.0),
             var_weight=config.get('loss_var_weight', 0.0),
+
             kl_weight=config.get('loss_kl_weight', 0.02),
             qnt_weight=config.get('loss_qnt_weight', 0.08),
+            mom_weight=config.get('loss_mom_weight', 0.03),
+
             log_all_terms=config.get('log_all_loss_terms', True),
+
             kl_bins=config.get('loss_kl_bins', 33),
             kl_eps=config.get('loss_kl_eps', 1e-8),
             kl_support_low=config.get('loss_kl_support_low', 0.001),
             kl_support_high=config.get('loss_kl_support_high', 0.999),
             kl_use_q10=config.get('loss_kl_use_q10', True),
             kl_q10_weight=config.get('loss_kl_q10_weight', 0.5),
+
             qnt_q_lo=config.get('loss_qnt_q_lo', 0.01),
             qnt_q_hi=config.get('loss_qnt_q_hi', 0.99),
             qnt_n_q=config.get('loss_qnt_n_q', 99),
@@ -503,6 +620,11 @@ def build_loss(config):
             qnt_tail_hi=config.get('loss_qnt_tail_hi', 0.90),
             qnt_top_q_regions=config.get('loss_qnt_top_q_regions', 0.25),
             qnt_eps=config.get('loss_qnt_eps', 1e-8),
+
+            mom_eps=config.get('loss_mom_eps', 1e-8),
+            mom_var_log_weight=config.get('loss_mom_var_log_weight', 1.0),
+            mom_skew_weight=config.get('loss_mom_skew_weight', 0.50),
+            mom_kurt_weight=config.get('loss_mom_kurt_weight', 0.25),
         )
     
 def plot_learning_curves(train_history, val_history, save_dir):

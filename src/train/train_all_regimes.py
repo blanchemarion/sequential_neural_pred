@@ -195,6 +195,9 @@ class CombinedLoss(nn.Module):
         trj_occ_bins: int = 12,
         trj_occ_weight: float = 0.60,
         trj_path_weight: float = 0.40,
+        # --- NEW: TRJ-only speed knobs ---
+        trj_fit_max_points: int = 8192,
+        trj_quantile_max_points: int = 16384,
     ):
         super().__init__()
         self.weights = {
@@ -233,6 +236,8 @@ class CombinedLoss(nn.Module):
         self.trj_occ_bins = trj_occ_bins
         self.trj_occ_weight = trj_occ_weight
         self.trj_path_weight = trj_path_weight
+        self.trj_fit_max_points = trj_fit_max_points
+        self.trj_quantile_max_points = trj_quantile_max_points
 
         # mae, shape, deriv, cross, var, kl, qnt, trj
         self.register_buffer('running_norms', torch.ones(8))
@@ -296,6 +301,16 @@ class CombinedLoss(nn.Module):
         denom = torch.sqrt((x * x).sum() + eps) * torch.sqrt((y * y).sum() + eps)
         return (x * y).sum() / denom
 
+    def _batch_corr_score_torch(self, x, y, eps=1e-8):
+        """
+        x, y: (B, T)
+        returns: (B,)
+        """
+        x = x - x.mean(dim=1, keepdim=True)
+        y = y - y.mean(dim=1, keepdim=True)
+        denom = torch.sqrt((x * x).sum(dim=1) + eps) * torch.sqrt((y * y).sum(dim=1) + eps)
+        return (x * y).sum(dim=1) / denom
+
     def _quantile_distance_torch(self, x, y, qs, eps=1e-8):
         x = x.float().reshape(-1)
         y = y.float().reshape(-1)
@@ -324,6 +339,29 @@ class CombinedLoss(nn.Module):
         if num is None or den <= 0:
             return torch.tensor(float('nan'), device=next(iter(values.values())).device)
         return num / den
+
+    def _subsample_rows(self, x, max_points):
+        """
+        x: (N, D)
+        returns: (min(N, max_points), D)
+        """
+        if max_points is None or max_points <= 0 or x.shape[0] <= max_points:
+            return x
+        idx = torch.randperm(x.shape[0], device=x.device)[:max_points]
+        return x.index_select(0, idx)
+
+    def _subsample_pair_1d(self, x, y, max_points):
+        """
+        x, y: (N,)
+        returns same-index subsample of both
+        """
+        x = x.reshape(-1)
+        y = y.reshape(-1)
+        n = x.shape[0]
+        if max_points is None or max_points <= 0 or n <= max_points:
+            return x, y
+        idx = torch.randperm(n, device=x.device)[:max_points]
+        return x.index_select(0, idx), y.index_select(0, idx)
 
     def _kl_distribution_loss(self, predictions, targets):
         """
@@ -427,22 +465,13 @@ class CombinedLoss(nn.Module):
 
     def _trajectory_distribution_loss(self, predictions, targets):
         """
-        Benchmark-inspired surrogate for TRJDIST_score01.
+        Cheaper TRJ surrogate.
 
-        Structure:
-          1) Standardize with GT stats
-          2) Fit GT PCA space
-          3) occupancy-velocity score:
-               - latent occupancy per PCA dim
-               - speed quantile score
-               - turning quantile score
-          4) path-features score:
-               - path length
-               - displacement
-               - radius
-               - persistence
-               - lag-1 speed autocorrelation
-          5) combine 0.60 * occupancy_velocity + 0.40 * path
+        Changes vs your original TRJ implementation:
+          1) GT PCA basis is computed from the VxV covariance matrix
+             instead of torch.pca_lowrank on (B*T, V).
+          2) Optional TRJ-only subsampling for PCA fitting / quantiles / histograms.
+          3) Path features are vectorized across the batch (no Python loop over B).
         """
         device = predictions.device
         dtype = predictions.dtype
@@ -463,20 +492,20 @@ class CombinedLoss(nn.Module):
         Xg_z = (Xg - mu) / sd
         Xp_z = (Xp - mu) / sd
 
-        # ---- GT PCA space ----
+        # ---- GT PCA space (cheap: covariance eigendecomposition) ----
         k = min(self.trj_pca_k_max, V)
-        q = min(max(k + 2, k), V)
-        # GT-only PCA basis; detached is faithful to benchmark "shared GT PCA space"
-        with torch.no_grad():
-            if Xg_z.is_cuda:
-                # pca_lowrank internally calls QR; CUDA geqrf is not implemented for fp16.
-                with torch.amp.autocast(device_type="cuda", enabled=False):
-                    _, _, Vh = torch.pca_lowrank(Xg_z.float(), q=q, center=False)
-            else:
-                _, _, Vh = torch.pca_lowrank(Xg_z, q=q, center=False)
-            basis = Vh[:, :k]  # (V, k)
 
-        # Keep latent projections in fp32 because quantile() only supports float/double.
+        with torch.no_grad():
+            Xg_fit = self._subsample_rows(Xg_z, self.trj_fit_max_points)  # TRJ-only subsample
+            denom = max(int(Xg_fit.shape[0]) - 1, 1)
+            cov = (Xg_fit.transpose(0, 1) @ Xg_fit) / denom              # (V, V)
+
+            # eigh is cheap here because V is small (e.g. 16)
+            evals, evecs = torch.linalg.eigh(cov)                         # ascending
+            idx = torch.argsort(evals, descending=True)[:k]
+            basis = evecs[:, idx]                                         # (V, k)
+
+        # Keep latent projections in fp32 because quantile() only supports float/double robustly.
         Zg = (Xg_z @ basis).float()   # (B*T, k)
         Zp = (Xp_z @ basis).float()   # (B*T, k)
 
@@ -486,8 +515,12 @@ class CombinedLoss(nn.Module):
         # ---- Occupancy score in latent dimensions ----
         occ_scores = []
         for dim in range(k):
-            zg_d = Zg[:, dim].float()
-            zp_d = Zp[:, dim].float()
+            zg_d_all = Zg[:, dim].float()
+            zp_d_all = Zp[:, dim].float()
+
+            zg_d, zp_d = self._subsample_pair_1d(
+                zg_d_all, zp_d_all, self.trj_quantile_max_points
+            )
 
             lo = torch.quantile(zg_d, 0.001)
             hi = torch.quantile(zg_d, 0.999)
@@ -507,9 +540,12 @@ class CombinedLoss(nn.Module):
         vg = torch.diff(Zg_seq, dim=1)  # (B, T-1, k)
         vp = torch.diff(Zp_seq, dim=1)
 
-        speed_g = torch.linalg.norm(vg, dim=-1).reshape(-1)
-        speed_p = torch.linalg.norm(vp, dim=-1).reshape(-1)
+        speed_g_all = torch.linalg.norm(vg, dim=-1).reshape(-1)
+        speed_p_all = torch.linalg.norm(vp, dim=-1).reshape(-1)
 
+        speed_g, speed_p = self._subsample_pair_1d(
+            speed_g_all, speed_p_all, self.trj_quantile_max_points
+        )
         speed_distance = self._quantile_distance_torch(
             speed_g, speed_p, qs=(0.1, 0.3, 0.5, 0.7, 0.9), eps=eps
         )
@@ -521,13 +557,16 @@ class CombinedLoss(nn.Module):
         vp1 = vp[:, 1:, :].reshape(-1, k)
         vp0 = vp[:, :-1, :].reshape(-1, k)
 
-        turn_g = torch.sum(vg1 * vg0, dim=-1) / (
+        turn_g_all = torch.sum(vg1 * vg0, dim=-1) / (
             torch.linalg.norm(vg1, dim=-1) * torch.linalg.norm(vg0, dim=-1) + eps
         )
-        turn_p = torch.sum(vp1 * vp0, dim=-1) / (
+        turn_p_all = torch.sum(vp1 * vp0, dim=-1) / (
             torch.linalg.norm(vp1, dim=-1) * torch.linalg.norm(vp0, dim=-1) + eps
         )
 
+        turn_g, turn_p = self._subsample_pair_1d(
+            turn_g_all, turn_p_all, self.trj_quantile_max_points
+        )
         turn_distance = self._quantile_distance_torch(
             turn_g, turn_p, qs=(0.1, 0.3, 0.5, 0.7, 0.9), eps=eps
         )
@@ -535,37 +574,47 @@ class CombinedLoss(nn.Module):
 
         occ_vel_score = torch.mean(torch.stack([occ_score, speed_score, turn_score]))
 
-        # ---- Path features score ----
-        path_feats_g = []
-        path_feats_p = []
-        for b in range(B):
-            zg_b = Zg_seq[b]          # (T, k)
-            zp_b = Zp_seq[b]
-            vg_b = torch.diff(zg_b, dim=0)
-            vp_b = torch.diff(zp_b, dim=0)
-
-            if vg_b.shape[0] < 4 or vp_b.shape[0] < 4:
-                continue
-
-            def _seq_features(z, v):
-                path = torch.sum(torch.linalg.norm(v, dim=1))
-                disp = torch.linalg.norm(z[-1] - z[0])
-                radius = torch.mean(torch.linalg.norm(z - z.mean(dim=0, keepdim=True), dim=1))
-                persistence = disp / (path + eps)
-
-                speed = torch.linalg.norm(v, dim=1)
-                speed_lag1 = self._corr_score_torch(speed[1:], speed[:-1], eps=eps)
-
-                return torch.stack([path, disp, radius, persistence, speed_lag1], dim=0)
-
-            path_feats_g.append(_seq_features(zg_b, vg_b))
-            path_feats_p.append(_seq_features(zp_b, vp_b))
-
-        if len(path_feats_g) == 0:
+        # ---- Path features score (vectorized over batch) ----
+        if T < 5:
             path_score = torch.zeros((), device=device, dtype=dtype)
         else:
-            fg = torch.stack(path_feats_g, dim=0)  # (B_valid, 5)
-            fp = torch.stack(path_feats_p, dim=0)
+            # path length
+            path_g = torch.linalg.norm(vg, dim=-1).sum(dim=1)                      # (B,)
+            path_p = torch.linalg.norm(vp, dim=-1).sum(dim=1)
+
+            # displacement
+            disp_g = torch.linalg.norm(Zg_seq[:, -1, :] - Zg_seq[:, 0, :], dim=-1) # (B,)
+            disp_p = torch.linalg.norm(Zp_seq[:, -1, :] - Zp_seq[:, 0, :], dim=-1)
+
+            # radius
+            radius_g = torch.linalg.norm(
+                Zg_seq - Zg_seq.mean(dim=1, keepdim=True), dim=-1
+            ).mean(dim=1)
+            radius_p = torch.linalg.norm(
+                Zp_seq - Zp_seq.mean(dim=1, keepdim=True), dim=-1
+            ).mean(dim=1)
+
+            # persistence
+            persistence_g = disp_g / (path_g + eps)
+            persistence_p = disp_p / (path_p + eps)
+
+            # lag-1 speed autocorrelation per sequence
+            speed_g_seq = torch.linalg.norm(vg, dim=-1)   # (B, T-1)
+            speed_p_seq = torch.linalg.norm(vp, dim=-1)
+
+            speed_lag1_g = self._batch_corr_score_torch(
+                speed_g_seq[:, 1:], speed_g_seq[:, :-1], eps=eps
+            )
+            speed_lag1_p = self._batch_corr_score_torch(
+                speed_p_seq[:, 1:], speed_p_seq[:, :-1], eps=eps
+            )
+
+            fg = torch.stack(
+                [path_g, disp_g, radius_g, persistence_g, speed_lag1_g], dim=1
+            )  # (B, 5)
+            fp = torch.stack(
+                [path_p, disp_p, radius_p, persistence_p, speed_lag1_p], dim=1
+            )  # (B, 5)
 
             denom = torch.mean(torch.abs(fg), dim=0) + eps
             path_distance = torch.mean(torch.abs(fp.mean(dim=0) - fg.mean(dim=0)) / denom)
@@ -783,6 +832,10 @@ def build_loss(config):
             trj_occ_bins=config.get('loss_trj_occ_bins', 12),
             trj_occ_weight=config.get('loss_trj_occ_weight', 0.60),
             trj_path_weight=config.get('loss_trj_path_weight', 0.40),
+
+            # NEW TRJ-only speed knobs
+            trj_fit_max_points=config.get('loss_trj_fit_max_points', 4096),
+            trj_quantile_max_points=config.get('loss_trj_quantile_max_points', 8192),
         )
     
 def plot_learning_curves(train_history, val_history, save_dir):

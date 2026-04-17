@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import sys
 import math
+import os
 
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent
@@ -30,6 +31,20 @@ from helpers.preprocess_helpers import (
     verify_data_loading,
 )
 from models.model_KV_cached import create_model_cached
+
+
+def _recommended_num_workers(requested_workers: int) -> int:
+    """
+    Cap dataloader workers to the process CPU affinity when available.
+    This avoids PyTorch warnings about over-provisioned workers.
+    """
+    if requested_workers <= 0:
+        return 0
+    try:
+        max_workers = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        max_workers = os.cpu_count() or requested_workers
+    return max(0, min(requested_workers, max_workers))
 
 
 # =========================
@@ -466,7 +481,12 @@ class CombinedLoss(nn.Module):
         q = min(max(k + 2, k), V)
         # GT-only PCA basis; detached is faithful to benchmark "shared GT PCA space"
         with torch.no_grad():
-            _, _, Vh = torch.pca_lowrank(Xg_z, q=q, center=False)
+            if Xg_z.is_cuda:
+                # pca_lowrank internally calls QR; CUDA geqrf is not implemented for fp16.
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    _, _, Vh = torch.pca_lowrank(Xg_z.float(), q=q, center=False)
+            else:
+                _, _, Vh = torch.pca_lowrank(Xg_z, q=q, center=False)
             basis = Vh[:, :k]  # (V, k)
 
         Zg = Xg_z @ basis   # (B*T, k)
@@ -962,7 +982,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ac
     component_totals_norm = {}
     component_totals_raw = {}
 
-    scaler = torch.cuda.amp.GradScaler() if (use_amp and torch.cuda.is_available()) else None
+    scaler = torch.amp.GradScaler("cuda") if (use_amp and torch.cuda.is_available()) else None
     optimizer.zero_grad()
 
     import time
@@ -991,7 +1011,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ac
         t_h2d += t2 - t1
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type="cuda"):
                 predictions = run_model_forward(model, input_batch, target_batch, current_p, forward_mode)
                 loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch)
                 loss = loss / accumulation_steps
@@ -1097,7 +1117,7 @@ def validate(model, val_loader, criterion, device, compute_per_region=False, n_v
             target_batch = target_batch.to(device, non_blocking=True)
 
             if use_amp and torch.cuda.is_available():
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type="cuda"):
                     predictions = run_model_forward(model, input_batch, target_batch, current_p, forward_mode)
                     loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch)
             else:
@@ -1547,13 +1567,14 @@ def main():
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     # Create dataloaders
+    num_workers = _recommended_num_workers(8)
     train_loader, val_loader = create_dataloaders(
         train_examples,
         val_examples,
         T_in=config['T_in'],
         T_out=config['T_out'],
         batch_size=config['batch_size'],
-        num_workers=8,
+        num_workers=num_workers,
     )
 
     #verify_data_loading(train_loader, val_loader)

@@ -173,7 +173,7 @@ class CombinedLoss(nn.Module):
         var_weight=0.0,
         kl_weight=0.0,
         qnt_weight=0.0,
-        mom_weight=0.0,
+        trj_weight=0.0,
         log_all_terms: bool = True,
         kl_bins: int = 33,
         kl_eps: float = 1e-8,
@@ -188,10 +188,11 @@ class CombinedLoss(nn.Module):
         qnt_tail_hi: float = 0.90,
         qnt_top_q_regions: float = 0.25,
         qnt_eps: float = 1e-8,
-        mom_eps: float = 1e-8,
-        mom_var_log_weight: float = 1.0,
-        mom_skew_weight: float = 0.50,
-        mom_kurt_weight: float = 0.25,
+        trj_eps: float = 1e-8,
+        trj_pca_k_max: int = 4,
+        trj_occ_bins: int = 12,
+        trj_occ_weight: float = 0.60,
+        trj_path_weight: float = 0.40,
     ):
         super().__init__()
         self.weights = {
@@ -202,7 +203,7 @@ class CombinedLoss(nn.Module):
             'var': var_weight,
             'kl': kl_weight,
             'qnt': qnt_weight,
-            'mom': mom_weight,
+            'trj': trj_weight,
         }
         self.log_all_terms = log_all_terms
         self.mae = nn.L1Loss()
@@ -224,13 +225,14 @@ class CombinedLoss(nn.Module):
         self.qnt_top_q_regions = qnt_top_q_regions
         self.qnt_eps = qnt_eps
 
-        # MOM params
-        self.mom_eps = mom_eps
-        self.mom_var_log_weight = mom_var_log_weight
-        self.mom_skew_weight = mom_skew_weight
-        self.mom_kurt_weight = mom_kurt_weight
+        # TRJ params
+        self.trj_eps = trj_eps
+        self.trj_pca_k_max = trj_pca_k_max
+        self.trj_occ_bins = trj_occ_bins
+        self.trj_occ_weight = trj_occ_weight
+        self.trj_path_weight = trj_path_weight
 
-        # mae, shape, deriv, cross, var, kl, qnt, mom
+        # mae, shape, deriv, cross, var, kl, qnt, trj
         self.register_buffer('running_norms', torch.ones(8))
         self.initialized = False
 
@@ -260,6 +262,66 @@ class CombinedLoss(nn.Module):
         probs = probs + eps
         probs = probs / probs.sum(dim=-1, keepdim=True)
         return probs
+
+    def _soft_histogram_1d(self, x, lo, hi, bins, eps):
+        """
+        x: (N,)
+        returns probs: (K,)
+        """
+        x = x.reshape(-1)
+        dtype = x.dtype
+        device = x.device
+
+        lo = torch.as_tensor(lo, device=device, dtype=dtype)
+        hi = torch.as_tensor(hi, device=device, dtype=dtype)
+        width = (hi - lo).clamp_min(1e-6) / bins
+        centers = lo + (torch.arange(bins, device=device, dtype=dtype) + 0.5) * width
+        sigma = 0.5 * width
+
+        w = torch.exp(-0.5 * ((x[:, None] - centers[None, :]) / sigma) ** 2)
+        probs = w.sum(dim=0) + eps
+        probs = probs / probs.sum()
+        return probs
+
+    def _score_from_distance_torch(self, distance, eps=1e-8):
+        return 1.0 / (1.0 + torch.clamp(distance, min=0.0))
+
+    def _corr_score_torch(self, x, y, eps=1e-8):
+        x = x.reshape(-1)
+        y = y.reshape(-1)
+        x = x - x.mean()
+        y = y - y.mean()
+        denom = torch.sqrt((x * x).sum() + eps) * torch.sqrt((y * y).sum() + eps)
+        return (x * y).sum() / denom
+
+    def _quantile_distance_torch(self, x, y, qs, eps=1e-8):
+        x = x.float().reshape(-1)
+        y = y.float().reshape(-1)
+        q = torch.tensor(qs, device=x.device, dtype=x.dtype)
+        qx = torch.quantile(x, q)
+        qy = torch.quantile(y, q)
+        denom = torch.mean(torch.abs(qx)) + eps
+        return torch.mean(torch.abs(qx - qy) / denom)
+
+    def _weighted_mean_available_torch(self, values, weights):
+        """
+        values: dict[str, scalar tensor]
+        weights: dict[str, float]
+        """
+        num = None
+        den = 0.0
+        for key, value in values.items():
+            w = float(weights.get(key, 0.0))
+            if w <= 0:
+                continue
+            if num is None:
+                num = value * w
+            else:
+                num = num + value * w
+            den += w
+        if num is None or den <= 0:
+            return torch.tensor(float('nan'), device=next(iter(values.values())).device)
+        return num / den
 
     def _kl_distribution_loss(self, predictions, targets):
         """
@@ -361,79 +423,161 @@ class CombinedLoss(nn.Module):
 
         return qnt_loss, D, qnt_score01, D_seq, d_tail
 
-    def _moment_distribution_loss(self, predictions, targets):
+    def _trajectory_distribution_loss(self, predictions, targets):
         """
-        Benchmark-inspired surrogate for MOM_score01.
+        Benchmark-inspired surrogate for TRJDIST_score01.
 
-        For each region v, flatten over batch and time:
-          dist_v = |log(var_p / var_g)|
-                   + 0.50 * |skew_p - skew_g|
-                   + 0.25 * |kurt_p - kurt_g|
-
-          score_v = 1 / (1 + dist_v)
-          MOM_score01 = mean_v score_v
-
-        Loss = 1 - MOM_score01
+        Structure:
+          1) Standardize with GT stats
+          2) Fit GT PCA space
+          3) occupancy-velocity score:
+               - latent occupancy per PCA dim
+               - speed quantile score
+               - turning quantile score
+          4) path-features score:
+               - path length
+               - displacement
+               - radius
+               - persistence
+               - lag-1 speed autocorrelation
+          5) combine 0.60 * occupancy_velocity + 0.40 * path
         """
         device = predictions.device
         dtype = predictions.dtype
-        eps = self.mom_eps
+        eps = self.trj_eps
 
+        B, T, V = predictions.shape
         pred_f = predictions.float()
         targ_f = targets.float()
 
-        # Flatten batch and time, preserve variable axis
-        pred_flat = pred_f.reshape(-1, pred_f.shape[-1])  # (B*T, V)
-        targ_flat = targ_f.reshape(-1, targ_f.shape[-1])  # (B*T, V)
+        # ---- Standardize with GT stats over pooled rows ----
+        Xg = targ_f.reshape(-1, V)  # (B*T, V)
+        Xp = pred_f.reshape(-1, V)  # (B*T, V)
 
-        # Means
-        mu_p = pred_flat.mean(dim=0)
-        mu_g = targ_flat.mean(dim=0)
+        mu = Xg.mean(dim=0, keepdim=True)
+        sd = Xg.std(dim=0, unbiased=False, keepdim=True)
+        sd = torch.where(sd < eps, torch.ones_like(sd), sd)
 
-        # Centered
-        cp = pred_flat - mu_p.unsqueeze(0)
-        cg = targ_flat - mu_g.unsqueeze(0)
+        Xg_z = (Xg - mu) / sd
+        Xp_z = (Xp - mu) / sd
 
-        # Variances
-        var_p = cp.pow(2).mean(dim=0).clamp_min(eps)
-        var_g = cg.pow(2).mean(dim=0).clamp_min(eps)
+        # ---- GT PCA space ----
+        k = min(self.trj_pca_k_max, V)
+        q = min(max(k + 2, k), V)
+        # GT-only PCA basis; detached is faithful to benchmark "shared GT PCA space"
+        with torch.no_grad():
+            _, _, Vh = torch.pca_lowrank(Xg_z, q=q, center=False)
+            basis = Vh[:, :k]  # (V, k)
 
-        std_p = torch.sqrt(var_p)
-        std_g = torch.sqrt(var_g)
+        Zg = Xg_z @ basis   # (B*T, k)
+        Zp = Xp_z @ basis   # (B*T, k)
 
-        # Standardized variables
-        zp = cp / std_p.unsqueeze(0)
-        zg = cg / std_g.unsqueeze(0)
+        Zg_seq = Zg.reshape(B, T, k)
+        Zp_seq = Zp.reshape(B, T, k)
 
-        # Skewness and excess kurtosis
-        skew_p = zp.pow(3).mean(dim=0)
-        skew_g = zg.pow(3).mean(dim=0)
+        # ---- Occupancy score in latent dimensions ----
+        occ_scores = []
+        for dim in range(k):
+            zg_d = Zg[:, dim]
+            zp_d = Zp[:, dim]
 
-        kurt_p = zp.pow(4).mean(dim=0) - 3.0
-        kurt_g = zg.pow(4).mean(dim=0) - 3.0
+            lo = torch.quantile(zg_d, 0.001)
+            hi = torch.quantile(zg_d, 0.999)
+            hi = torch.maximum(hi, lo + torch.tensor(1e-6, device=device, dtype=zg_d.dtype))
 
-        dist = (
-            self.mom_var_log_weight * torch.abs(torch.log(var_p) - torch.log(var_g))
-            + self.mom_skew_weight * torch.abs(skew_p - skew_g)
-            + self.mom_kurt_weight * torch.abs(kurt_p - kurt_g)
-        )  # (V,)
+            pg = self._soft_histogram_1d(zg_d, lo, hi, self.trj_occ_bins, eps)
+            pp = self._soft_histogram_1d(zp_d, lo, hi, self.trj_occ_bins, eps)
 
-        mom_region_score = 1.0 / (1.0 + dist)
-        mom_score01 = mom_region_score.mean()
-        mom_loss = 1.0 - mom_score01
+            kl_gp = torch.sum(pg * (torch.log(pg + eps) - torch.log(pp + eps)))
+            kl_pg = torch.sum(pp * (torch.log(pp + eps) - torch.log(pg + eps)))
+            d_occ = 0.5 * (kl_gp + kl_pg)
+            occ_scores.append(self._score_from_distance_torch(d_occ, eps=eps))
 
-        # Useful raw diagnostics
-        mom_var_term = torch.abs(torch.log(var_p) - torch.log(var_g)).mean().to(dtype)
-        mom_skew_term = torch.abs(skew_p - skew_g).mean().to(dtype)
-        mom_kurt_term = torch.abs(kurt_p - kurt_g).mean().to(dtype)
+        occ_score = torch.stack(occ_scores).mean()
+
+        # ---- Velocity / turning scores ----
+        vg = torch.diff(Zg_seq, dim=1)  # (B, T-1, k)
+        vp = torch.diff(Zp_seq, dim=1)
+
+        speed_g = torch.linalg.norm(vg, dim=-1).reshape(-1)
+        speed_p = torch.linalg.norm(vp, dim=-1).reshape(-1)
+
+        speed_distance = self._quantile_distance_torch(
+            speed_g, speed_p, qs=(0.1, 0.3, 0.5, 0.7, 0.9), eps=eps
+        )
+        speed_score = self._score_from_distance_torch(speed_distance, eps=eps)
+
+        # turning cosine between consecutive velocity vectors
+        vg1 = vg[:, 1:, :].reshape(-1, k)
+        vg0 = vg[:, :-1, :].reshape(-1, k)
+        vp1 = vp[:, 1:, :].reshape(-1, k)
+        vp0 = vp[:, :-1, :].reshape(-1, k)
+
+        turn_g = torch.sum(vg1 * vg0, dim=-1) / (
+            torch.linalg.norm(vg1, dim=-1) * torch.linalg.norm(vg0, dim=-1) + eps
+        )
+        turn_p = torch.sum(vp1 * vp0, dim=-1) / (
+            torch.linalg.norm(vp1, dim=-1) * torch.linalg.norm(vp0, dim=-1) + eps
+        )
+
+        turn_distance = self._quantile_distance_torch(
+            turn_g, turn_p, qs=(0.1, 0.3, 0.5, 0.7, 0.9), eps=eps
+        )
+        turn_score = self._score_from_distance_torch(turn_distance, eps=eps)
+
+        occ_vel_score = torch.mean(torch.stack([occ_score, speed_score, turn_score]))
+
+        # ---- Path features score ----
+        path_feats_g = []
+        path_feats_p = []
+        for b in range(B):
+            zg_b = Zg_seq[b]          # (T, k)
+            zp_b = Zp_seq[b]
+            vg_b = torch.diff(zg_b, dim=0)
+            vp_b = torch.diff(zp_b, dim=0)
+
+            if vg_b.shape[0] < 4 or vp_b.shape[0] < 4:
+                continue
+
+            def _seq_features(z, v):
+                path = torch.sum(torch.linalg.norm(v, dim=1))
+                disp = torch.linalg.norm(z[-1] - z[0])
+                radius = torch.mean(torch.linalg.norm(z - z.mean(dim=0, keepdim=True), dim=1))
+                persistence = disp / (path + eps)
+
+                speed = torch.linalg.norm(v, dim=1)
+                speed_lag1 = self._corr_score_torch(speed[1:], speed[:-1], eps=eps)
+
+                return torch.stack([path, disp, radius, persistence, speed_lag1], dim=0)
+
+            path_feats_g.append(_seq_features(zg_b, vg_b))
+            path_feats_p.append(_seq_features(zp_b, vp_b))
+
+        if len(path_feats_g) == 0:
+            path_score = torch.zeros((), device=device, dtype=dtype)
+        else:
+            fg = torch.stack(path_feats_g, dim=0)  # (B_valid, 5)
+            fp = torch.stack(path_feats_p, dim=0)
+
+            denom = torch.mean(torch.abs(fg), dim=0) + eps
+            path_distance = torch.mean(torch.abs(fp.mean(dim=0) - fg.mean(dim=0)) / denom)
+            path_score = self._score_from_distance_torch(path_distance, eps=eps)
+
+        trj_score01 = self._weighted_mean_available_torch(
+            {'occupancy_velocity': occ_vel_score, 'path': path_score},
+            {'occupancy_velocity': self.trj_occ_weight, 'path': self.trj_path_weight},
+        )
+
+        trj_loss = 1.0 - trj_score01
 
         return (
-            mom_loss.to(dtype),
-            mom_score01.to(dtype),
-            mom_region_score.to(dtype),
-            mom_var_term,
-            mom_skew_term,
-            mom_kurt_term,
+            trj_loss.to(dtype),
+            trj_score01.to(dtype),
+            occ_vel_score.to(dtype),
+            path_score.to(dtype),
+            occ_score.to(dtype),
+            speed_score.to(dtype),
+            turn_score.to(dtype),
         )
 
     def forward(self, predictions, targets):
@@ -450,7 +594,7 @@ class CombinedLoss(nn.Module):
         var_raw   = torch.zeros((), device=device, dtype=dtype)
         kl_raw    = torch.zeros((), device=device, dtype=dtype)
         qnt_raw   = torch.zeros((), device=device, dtype=dtype)
-        mom_raw   = torch.zeros((), device=device, dtype=dtype)
+        trj_raw   = torch.zeros((), device=device, dtype=dtype)
 
         kl_mean_raw = torch.zeros((), device=device, dtype=dtype)
         kl_q10_raw = torch.zeros((), device=device, dtype=dtype)
@@ -459,10 +603,12 @@ class CombinedLoss(nn.Module):
         qnt_D_raw = torch.zeros((), device=device, dtype=dtype)
         qnt_score01_raw = torch.zeros((), device=device, dtype=dtype)
 
-        mom_score01_raw = torch.zeros((), device=device, dtype=dtype)
-        mom_var_term_raw = torch.zeros((), device=device, dtype=dtype)
-        mom_skew_term_raw = torch.zeros((), device=device, dtype=dtype)
-        mom_kurt_term_raw = torch.zeros((), device=device, dtype=dtype)
+        trj_score01_raw = torch.zeros((), device=device, dtype=dtype)
+        trj_occvel_score_raw = torch.zeros((), device=device, dtype=dtype)
+        trj_path_score_raw = torch.zeros((), device=device, dtype=dtype)
+        trj_occ_score_raw = torch.zeros((), device=device, dtype=dtype)
+        trj_speed_score_raw = torch.zeros((), device=device, dtype=dtype)
+        trj_turn_score_raw = torch.zeros((), device=device, dtype=dtype)
 
         need_shape = (self.weights['shape'] != 0) or self.log_all_terms
         need_deriv = (self.weights['deriv'] != 0) or self.log_all_terms
@@ -470,7 +616,7 @@ class CombinedLoss(nn.Module):
         need_var   = (self.weights['var']   != 0) or self.log_all_terms
         need_kl    = (self.weights['kl']    != 0) or self.log_all_terms
         need_qnt   = (self.weights['qnt']   != 0) or self.log_all_terms
-        need_mom   = (self.weights['mom']   != 0) or self.log_all_terms
+        need_trj   = (self.weights['trj']   != 0) or self.log_all_terms
 
         if need_shape:
             pred_norm = predictions - predictions.mean(dim=1, keepdim=True)
@@ -514,15 +660,16 @@ class CombinedLoss(nn.Module):
         if need_qnt:
             qnt_raw, qnt_D_raw, qnt_score01_raw, _, _ = self._qnt_distribution_loss(predictions, targets)
 
-        if need_mom:
+        if need_trj:
             (
-                mom_raw,
-                mom_score01_raw,
-                _,
-                mom_var_term_raw,
-                mom_skew_term_raw,
-                mom_kurt_term_raw,
-            ) = self._moment_distribution_loss(predictions, targets)
+                trj_raw,
+                trj_score01_raw,
+                trj_occvel_score_raw,
+                trj_path_score_raw,
+                trj_occ_score_raw,
+                trj_speed_score_raw,
+                trj_turn_score_raw,
+            ) = self._trajectory_distribution_loss(predictions, targets)
 
         if not self.initialized and self.training:
             self.running_norms[0] = mae_raw.detach() + 1e-8
@@ -532,7 +679,7 @@ class CombinedLoss(nn.Module):
             self.running_norms[4] = (var_raw.detach()   + 1e-8) if need_var   else torch.tensor(1.0, device=device)
             self.running_norms[5] = (kl_raw.detach()    + 1e-8) if need_kl    else torch.tensor(1.0, device=device)
             self.running_norms[6] = (qnt_raw.detach()   + 1e-8) if need_qnt   else torch.tensor(1.0, device=device)
-            self.running_norms[7] = (mom_raw.detach()   + 1e-8) if need_mom   else torch.tensor(1.0, device=device)
+            self.running_norms[7] = (trj_raw.detach()   + 1e-8) if need_trj   else torch.tensor(1.0, device=device)
             self.initialized = True
 
         total = self.weights['mae'] * (mae_raw / self.running_norms[0])
@@ -548,8 +695,8 @@ class CombinedLoss(nn.Module):
             total = total + self.weights['kl'] * (kl_raw / self.running_norms[5])
         if self.weights['qnt'] != 0:
             total = total + self.weights['qnt'] * (qnt_raw / self.running_norms[6])
-        if self.weights['mom'] != 0:
-            total = total + self.weights['mom'] * (mom_raw / self.running_norms[7])
+        if self.weights['trj'] != 0:
+            total = total + self.weights['trj'] * (trj_raw / self.running_norms[7])
 
         loss_dict_norm = {
             'mae':   (mae_raw   / self.running_norms[0]),
@@ -559,7 +706,7 @@ class CombinedLoss(nn.Module):
             'var':   (var_raw   / self.running_norms[4]) if need_var   else torch.zeros((), device=device),
             'kl':    (kl_raw    / self.running_norms[5]) if need_kl    else torch.zeros((), device=device),
             'qnt':   (qnt_raw   / self.running_norms[6]) if need_qnt   else torch.zeros((), device=device),
-            'mom':   (mom_raw   / self.running_norms[7]) if need_mom   else torch.zeros((), device=device),
+            'trj':   (trj_raw   / self.running_norms[7]) if need_trj   else torch.zeros((), device=device),
             'total': total
         }
 
@@ -579,11 +726,13 @@ class CombinedLoss(nn.Module):
             'qnt_D': qnt_D_raw if need_qnt else torch.zeros((), device=device),
             'qnt_score01': qnt_score01_raw if need_qnt else torch.zeros((), device=device),
 
-            'mom': mom_raw if need_mom else torch.zeros((), device=device),
-            'mom_score01': mom_score01_raw if need_mom else torch.zeros((), device=device),
-            'mom_var_term': mom_var_term_raw if need_mom else torch.zeros((), device=device),
-            'mom_skew_term': mom_skew_term_raw if need_mom else torch.zeros((), device=device),
-            'mom_kurt_term': mom_kurt_term_raw if need_mom else torch.zeros((), device=device),
+            'trj': trj_raw if need_trj else torch.zeros((), device=device),
+            'trj_score01': trj_score01_raw if need_trj else torch.zeros((), device=device),
+            'trj_occvel_score': trj_occvel_score_raw if need_trj else torch.zeros((), device=device),
+            'trj_path_score': trj_path_score_raw if need_trj else torch.zeros((), device=device),
+            'trj_occ_score': trj_occ_score_raw if need_trj else torch.zeros((), device=device),
+            'trj_speed_score': trj_speed_score_raw if need_trj else torch.zeros((), device=device),
+            'trj_turn_score': trj_turn_score_raw if need_trj else torch.zeros((), device=device),
 
             'total': total,
         }
@@ -602,7 +751,7 @@ def build_loss(config):
 
             kl_weight=config.get('loss_kl_weight', 0.02),
             qnt_weight=config.get('loss_qnt_weight', 0.08),
-            mom_weight=config.get('loss_mom_weight', 0.03),
+            trj_weight=config.get('loss_trj_weight', 0.03),
 
             log_all_terms=config.get('log_all_loss_terms', True),
 
@@ -621,10 +770,11 @@ def build_loss(config):
             qnt_top_q_regions=config.get('loss_qnt_top_q_regions', 0.25),
             qnt_eps=config.get('loss_qnt_eps', 1e-8),
 
-            mom_eps=config.get('loss_mom_eps', 1e-8),
-            mom_var_log_weight=config.get('loss_mom_var_log_weight', 1.0),
-            mom_skew_weight=config.get('loss_mom_skew_weight', 0.50),
-            mom_kurt_weight=config.get('loss_mom_kurt_weight', 0.25),
+            trj_eps=config.get('loss_trj_eps', 1e-8),
+            trj_pca_k_max=config.get('loss_trj_pca_k_max', 4),
+            trj_occ_bins=config.get('loss_trj_occ_bins', 12),
+            trj_occ_weight=config.get('loss_trj_occ_weight', 0.60),
+            trj_path_weight=config.get('loss_trj_path_weight', 0.40),
         )
     
 def plot_learning_curves(train_history, val_history, save_dir):

@@ -64,8 +64,10 @@ SEEDS = [102] #[102, 103, 104]
 #MODE_COLORS = {"TF_QTL_0.1": "#2E86AB"}
 #MODES = ["TF_QTL_0.08_KL_0.02"]
 #MODE_COLORS = {"TF_QTL_0.08_KL_0.02": "#2E86AB"}
-MODES = ["TF_QTL_0.08_KL_0.02_MOM_0.03"]
-MODE_COLORS = {"TF_QTL_0.08_KL_0.02_MOM_0.03": "#2E86AB"}
+#MODES = ["TF_QTL_0.08_KL_0.02_MOM_0.03"]
+MODES = ["TF_QTL_0.08_KL_0.02_TRJ_0.03"]
+#MODE_COLORS = {"TF_QTL_0.08_KL_0.02_MOM_0.03": "#2E86AB"}
+MODE_COLORS = {"TF_QTL_0.08_KL_0.02_TRJ_0.03": "#2E86AB"}
 
 def load_existing_long_neurobench_runs(
     main_output_dir: Path,
@@ -692,7 +694,8 @@ def main():
             #"TF": "checkpoints_tf_2",
             #"TF_QTL_0.1": "checkpoints_TF_QTL_0.1",
             #"TF_QTL_0.08_KL_0.02": "checkpoints_TF_QTL_0.08_KL_0.02",
-            "TF_QTL_0.08_KL_0.02_MOM_0.03": "checkpoints_TF_QTL_0.08_KL_0.02_MOM_0.03",
+            #"TF_QTL_0.08_KL_0.02_MOM_0.03": "checkpoints_TF_QTL_0.08_KL_0.02_MOM_0.03",
+            "TF_QTL_0.08_KL_0.02_TRJ_0.03": "checkpoints_TF_QTL_0.08_KL_0.02_TRJ_0.03",
             #"MIX_TF_AR_KV": "checkpoints_mix_tf_ar",
             #"1_step": "checkpoints_1_step",
         }

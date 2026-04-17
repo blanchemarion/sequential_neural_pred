@@ -69,10 +69,10 @@ export PYTHONUNBUFFERED=1
 
 # ---- PyTorch memory management ----
 # Use expandable segments to reduce fragmentation (new variable name)
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+#export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 # Alternative: Use the older variable name for compatibility
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda)"
 

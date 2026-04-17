@@ -33,19 +33,6 @@ from helpers.preprocess_helpers import (
 from models.model_KV_cached import create_model_cached
 
 
-def _recommended_num_workers(requested_workers: int) -> int:
-    """
-    Cap dataloader workers to the process CPU affinity when available.
-    This avoids PyTorch warnings about over-provisioned workers.
-    """
-    if requested_workers <= 0:
-        return 0
-    try:
-        max_workers = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        max_workers = os.cpu_count() or requested_workers
-    return max(0, min(requested_workers, max_workers))
-
 
 # =========================
 # 1) CombinedLoss: compute components even when weights are 0 (for logging)
@@ -489,8 +476,9 @@ class CombinedLoss(nn.Module):
                 _, _, Vh = torch.pca_lowrank(Xg_z, q=q, center=False)
             basis = Vh[:, :k]  # (V, k)
 
-        Zg = Xg_z @ basis   # (B*T, k)
-        Zp = Xp_z @ basis   # (B*T, k)
+        # Keep latent projections in fp32 because quantile() only supports float/double.
+        Zg = (Xg_z @ basis).float()   # (B*T, k)
+        Zp = (Xp_z @ basis).float()   # (B*T, k)
 
         Zg_seq = Zg.reshape(B, T, k)
         Zp_seq = Zp.reshape(B, T, k)
@@ -498,8 +486,8 @@ class CombinedLoss(nn.Module):
         # ---- Occupancy score in latent dimensions ----
         occ_scores = []
         for dim in range(k):
-            zg_d = Zg[:, dim]
-            zp_d = Zp[:, dim]
+            zg_d = Zg[:, dim].float()
+            zp_d = Zp[:, dim].float()
 
             lo = torch.quantile(zg_d, 0.001)
             hi = torch.quantile(zg_d, 0.999)
@@ -1567,14 +1555,13 @@ def main():
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     # Create dataloaders
-    num_workers = _recommended_num_workers(8)
     train_loader, val_loader = create_dataloaders(
         train_examples,
         val_examples,
         T_in=config['T_in'],
         T_out=config['T_out'],
         batch_size=config['batch_size'],
-        num_workers=num_workers,
+        num_workers=8,
     )
 
     #verify_data_loading(train_loader, val_loader)

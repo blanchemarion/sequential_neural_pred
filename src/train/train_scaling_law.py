@@ -865,8 +865,8 @@ def train_single_scaling_run(
 
     if training_variants is None:
         training_variants = [
-            #{"tag": "AR_KV", "label": "KV Autoregressive"},
-            {"tag": "TF", "label": "Teacher Forced"},
+            {"tag": "AR_KV", "label": "KV Autoregressive"},
+            #{"tag": "TF", "label": "Teacher Forced"},
             #{"tag": "AR", "label": "Autoregressive"},
         ]
 

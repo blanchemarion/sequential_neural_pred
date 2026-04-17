@@ -1561,7 +1561,7 @@ def main():
         T_in=config['T_in'],
         T_out=config['T_out'],
         batch_size=config['batch_size'],
-        num_workers=8,
+        num_workers=6,
     )
 
     #verify_data_loading(train_loader, val_loader)

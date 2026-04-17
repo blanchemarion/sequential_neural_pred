@@ -501,7 +501,11 @@ class CombinedLoss(nn.Module):
             cov = (Xg_fit.transpose(0, 1) @ Xg_fit) / denom              # (V, V)
 
             # eigh is cheap here because V is small (e.g. 16)
-            evals, evecs = torch.linalg.eigh(cov)                         # ascending
+            if cov.is_cuda:
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    evals, evecs = torch.linalg.eigh(cov.float())          # ascending
+            else:
+                evals, evecs = torch.linalg.eigh(cov.float())              # ascending
             idx = torch.argsort(evals, descending=True)[:k]
             basis = evecs[:, idx]                                         # (V, k)
 

@@ -1182,7 +1182,7 @@ def train_single_scaling_run(
         ]
 
     histories = []
-    for variant in training_variants:
+    """for variant in training_variants:
         history = train_single_mode(
             config,
             train_loader,
@@ -1191,7 +1191,7 @@ def train_single_scaling_run(
             mode_tag=variant["tag"],
             mode_label=variant["label"],
         )
-        histories.append(history)
+        histories.append(history)"""
 
     return histories
 

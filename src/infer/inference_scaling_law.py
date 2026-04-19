@@ -40,8 +40,8 @@ from helpers.scaling_law_globals import (
     merge_paths_section,
     resolve_repo_relative,
 )
-#from models.model_KV_cached import create_model_cached
-from models.models import create_model
+from models.model_KV_cached import create_model_cached
+#from models.models import create_model
 
 _inf_defaults = merge_inference_scaling_law_section(load_scaling_law_globals())
 NUM_SEQUENCES = int(_inf_defaults["num_sequences"])
@@ -152,18 +152,7 @@ def create_inference_model(checkpoint_path: Path, T_in: int, T_out: int, device)
     print(f"  Loading checkpoint from {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = checkpoint["config"]
-    """model = create_model_cached(
-        n_vars=cfg["n_vars"],
-        d_model=cfg["d_model"],
-        n_heads=cfg["n_heads"],
-        n_layers=cfg["n_layers"],
-        d_ff=cfg["d_ff"],
-        dropout=cfg["dropout"],
-        T_in=T_in,
-        T_out=T_out,
-        device=device,
-    )"""
-    model = create_model(
+    model = create_model_cached(
         n_vars=cfg["n_vars"],
         d_model=cfg["d_model"],
         n_heads=cfg["n_heads"],
@@ -191,8 +180,8 @@ def generate_long_sequence(model, initial_input, target_length, T_in, T_out, dev
                 pad_len = T_in - current_sequence.shape[1]
                 pad = current_sequence[:, :1, :].repeat(1, pad_len, 1)
                 input_chunk = torch.cat([pad, current_sequence], dim=1)
-            #pred = model.forward_autoregressive_kvcache(input_chunk, block_offset=block_offset)
-            pred = model.forward_autoregressive(input_chunk, block_offset = block_offset)
+            pred = model.forward_autoregressive_kvcache(input_chunk, block_offset=block_offset)
+            #pred = model.forward_autoregressive(input_chunk, block_offset = block_offset)
             current_sequence = torch.cat([current_sequence, pred], dim=1)
     return current_sequence[:, :target_length, :]
 

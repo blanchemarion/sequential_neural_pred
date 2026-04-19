@@ -1625,10 +1625,10 @@ def main():
     
     # Train both modes sequentially
     training_variants = [
-        #{'tag': 'AR_KV', 'label': 'KV Autoregressive'},
+        {'tag': 'AR_KV', 'label': 'KV Autoregressive'},
         #{'tag': 'MIX_TF_AR_KV', 'label': 'Mixed Teacher Forcing and Autoregressive'},
         #{'tag': 'AR', 'label': 'Autoregressive'},
-        {'tag': 'TF', 'label': 'Teacher Forcing'},
+        #{'tag': 'TF', 'label': 'Teacher Forcing'},
     ]
 
     

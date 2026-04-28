@@ -85,7 +85,7 @@ python src/train/train_simple_2p_baselines.py \
   --model_type decay \
   --T_in 90 \
   --T_out_train 1 \
-  --num_epochs 8 \
+  --num_epochs 150 \
   --batch_size 2048 \
   --lr 1e-3 \
   --weight_decay 1e-4 \
@@ -100,7 +100,7 @@ python src/train/train_simple_2p_baselines.py \
   --T_in 90 \
   --T_out_train 1 \
   --K_lags 60 \
-  --num_epochs 30 \
+  --num_epochs 150 \
   --batch_size 2048 \
   --lr 1e-3 \
   --weight_decay 1e-4 \
@@ -115,8 +115,8 @@ python src/train/train_simple_2p_baselines.py \
   --T_in 90 \
   --T_out_train 1 \
   --hidden_size 128 \
-  --num_layers 1 \
-  --num_epochs 30 \
+  --num_layers 2 \
+  --num_epochs 150 \
   --batch_size 1024 \
   --lr 1e-3 \
   --weight_decay 1e-4 \

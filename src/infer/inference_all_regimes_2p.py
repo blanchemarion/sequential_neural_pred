@@ -47,7 +47,7 @@ from helpers.preprocess_helpers import (
 
 from models.model_KV_cached_2p import create_model_cached
 
-NUM_SEQUENCES = 100
+NUM_SEQUENCES = 10
 SHORT_PRED_LENGTH = 30  # Fixed prediction length for short window
 LONG_PRED_LENGTH = 420  # Fixed prediction length for long window
 SEEDS = [102] #[102, 103, 104]

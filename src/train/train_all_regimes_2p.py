@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import sys
 import math
 import os
+import json
 
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent
@@ -24,14 +25,86 @@ if str(_SRC_ROOT) not in sys.path:
 from helpers.preprocess_helpers import (
     load_data,
     reshape_to_examples,
-    split_by_sequences,
     create_dataloaders,
     filter_examples_by_nan,
-    normalize_after_split_input_only,
     verify_data_loading,
+    compute_train_stats_input_only,
+    apply_normalization_nct,
 )
-from models.model_KV_cached import create_model_cached
+from models.model_KV_cached_2p import create_model_cached
 
+
+def apply_robust_std_floor_numpy(
+    std: np.ndarray,
+    eps: float,
+    floor_abs: float,
+    floor_frac_median: float,
+) -> tuple[np.ndarray, float, float]:
+    """
+    Raise near-zero per-channel stds so z-scoring does not explode on silent neurons.
+
+    floor = max(eps, floor_abs, floor_frac_median * median(per-channel std))
+    """
+    flat = std.astype(np.float64).reshape(-1)
+    med = float(np.median(flat))
+    floor = max(float(eps), float(floor_abs), float(floor_frac_median) * med)
+    out = np.maximum(std.astype(np.float64), floor).astype(np.float32)
+    return out, floor, med
+
+
+def normalize_split_robust_2p(
+    train_examples: np.ndarray,
+    val_examples: np.ndarray,
+    test_examples: np.ndarray | None,
+    T_in: int,
+    eps: float,
+    floor_abs: float,
+    floor_frac_median: float,
+    save_stats_path: str | None = None,
+):
+    """
+    Train-only input-window mean/std (same as preprocess_helpers), then robust std floor, then z-score.
+    Saves *_mean.npy / *_std.npy / *_meta.json compatible with inference loaders.
+    """
+    mean, std = compute_train_stats_input_only(train_examples, T_in=T_in, eps=eps)
+    std, floor_used, med_before = apply_robust_std_floor_numpy(
+        std, eps=eps, floor_abs=floor_abs, floor_frac_median=floor_frac_median
+    )
+    print(
+        f"[norm 2p] median std (train input window, pre-floor): {med_before:.6g} | "
+        f"robust floor applied: {floor_used:.6g}"
+    )
+
+    train_norm = apply_normalization_nct(train_examples, mean, std)
+    val_norm = apply_normalization_nct(val_examples, mean, std)
+    test_norm = None if test_examples is None else apply_normalization_nct(test_examples, mean, std)
+
+    if save_stats_path is not None:
+        save_path = Path(save_stats_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        base_path = save_path.with_suffix("")
+        mean_path = base_path.parent / f"{base_path.name}_mean.npy"
+        std_path = base_path.parent / f"{base_path.name}_std.npy"
+        meta_path = base_path.parent / f"{base_path.name}_meta.json"
+        np.save(str(mean_path), mean.astype(np.float32))
+        np.save(str(std_path), std.astype(np.float32))
+        meta = {
+            "layout": "NCT",
+            "computed_on": "TRAIN_ONLY",
+            "timepoints_used_for_stats": f"[0:{T_in})",
+            "eps": float(eps),
+            "robust_std_floor": float(floor_used),
+            "median_std_before_floor": float(med_before),
+            "floor_frac_median": float(floor_frac_median),
+            "floor_abs": float(floor_abs),
+        }
+        meta_path.write_text(json.dumps(meta, indent=2))
+        print("Saved normalization stats to:")
+        print(f"  Mean: {mean_path}")
+        print(f"  Std:  {std_path}")
+        print(f"  Meta: {meta_path}")
+
+    return train_norm, val_norm, test_norm, (mean, std, "NCT_robust")
 
 
 # =========================
@@ -175,7 +248,6 @@ class CombinedLoss(nn.Module):
         var_weight=0.0,
         kl_weight=0.0,
         qnt_weight=0.0,
-        trj_weight=0.0,
         log_all_terms: bool = True,
         kl_bins: int = 33,
         kl_eps: float = 1e-8,
@@ -190,14 +262,10 @@ class CombinedLoss(nn.Module):
         qnt_tail_hi: float = 0.90,
         qnt_top_q_regions: float = 0.25,
         qnt_eps: float = 1e-8,
-        trj_eps: float = 1e-8,
-        trj_pca_k_max: int = 4,
-        trj_occ_bins: int = 12,
-        trj_occ_weight: float = 0.60,
-        trj_path_weight: float = 0.40,
-        # --- NEW: TRJ-only speed knobs ---
-        trj_fit_max_points: int = 8192,
-        trj_quantile_max_points: int = 16384,
+        spike_weight_beta: float = 0.0,
+        spike_z_threshold: float = 2.0,
+        false_positive_weight: float = 0.0,
+        false_positive_z_threshold: float = 0.5,
     ):
         super().__init__()
         self.weights = {
@@ -208,7 +276,6 @@ class CombinedLoss(nn.Module):
             'var': var_weight,
             'kl': kl_weight,
             'qnt': qnt_weight,
-            'trj': trj_weight,
         }
         self.log_all_terms = log_all_terms
         self.mae = nn.L1Loss()
@@ -230,16 +297,13 @@ class CombinedLoss(nn.Module):
         self.qnt_top_q_regions = qnt_top_q_regions
         self.qnt_eps = qnt_eps
 
-        # TRJ params
-        self.trj_eps = trj_eps
-        self.trj_pca_k_max = trj_pca_k_max
-        self.trj_occ_bins = trj_occ_bins
-        self.trj_occ_weight = trj_occ_weight
-        self.trj_path_weight = trj_path_weight
-        self.trj_fit_max_points = trj_fit_max_points
-        self.trj_quantile_max_points = trj_quantile_max_points
+        # Spike-weighted MAE (targets assumed z-scored): upweight |target| > threshold
+        self.spike_weight_beta = float(spike_weight_beta)
+        self.spike_z_threshold = float(spike_z_threshold)
+        self.false_positive_weight = float(false_positive_weight)
+        self.false_positive_z_threshold = float(false_positive_z_threshold)
 
-        # mae, shape, deriv, cross, var, kl, qnt, trj
+        # mae, shape, deriv, cross, var, kl, qnt
         self.register_buffer('running_norms', torch.ones(8))
         self.initialized = False
 
@@ -463,191 +527,29 @@ class CombinedLoss(nn.Module):
 
         return qnt_loss, D, qnt_score01, D_seq, d_tail
 
-    def _trajectory_distribution_loss(self, predictions, targets):
-        """
-        Cheaper TRJ surrogate.
-
-        Changes vs your original TRJ implementation:
-          1) GT PCA basis is computed from the VxV covariance matrix
-             instead of torch.pca_lowrank on (B*T, V).
-          2) Optional TRJ-only subsampling for PCA fitting / quantiles / histograms.
-          3) Path features are vectorized across the batch (no Python loop over B).
-        """
-        device = predictions.device
-        dtype = predictions.dtype
-        eps = self.trj_eps
-
-        B, T, V = predictions.shape
-        pred_f = predictions.float()
-        targ_f = targets.float()
-
-        # ---- Standardize with GT stats over pooled rows ----
-        Xg = targ_f.reshape(-1, V)  # (B*T, V)
-        Xp = pred_f.reshape(-1, V)  # (B*T, V)
-
-        mu = Xg.mean(dim=0, keepdim=True)
-        sd = Xg.std(dim=0, unbiased=False, keepdim=True)
-        sd = torch.where(sd < eps, torch.ones_like(sd), sd)
-
-        Xg_z = (Xg - mu) / sd
-        Xp_z = (Xp - mu) / sd
-
-        # ---- GT PCA space (cheap: covariance eigendecomposition) ----
-        k = min(self.trj_pca_k_max, V)
-
-        with torch.no_grad():
-            Xg_fit = self._subsample_rows(Xg_z, self.trj_fit_max_points)  # TRJ-only subsample
-            denom = max(int(Xg_fit.shape[0]) - 1, 1)
-            cov = (Xg_fit.transpose(0, 1) @ Xg_fit) / denom              # (V, V)
-
-            # eigh is cheap here because V is small (e.g. 16)
-            if cov.is_cuda:
-                with torch.amp.autocast(device_type="cuda", enabled=False):
-                    evals, evecs = torch.linalg.eigh(cov.float())          # ascending
-            else:
-                evals, evecs = torch.linalg.eigh(cov.float())              # ascending
-            idx = torch.argsort(evals, descending=True)[:k]
-            basis = evecs[:, idx]                                         # (V, k)
-
-        # Keep latent projections in fp32 because quantile() only supports float/double robustly.
-        Zg = (Xg_z @ basis).float()   # (B*T, k)
-        Zp = (Xp_z @ basis).float()   # (B*T, k)
-
-        Zg_seq = Zg.reshape(B, T, k)
-        Zp_seq = Zp.reshape(B, T, k)
-
-        # ---- Occupancy score in latent dimensions ----
-        occ_scores = []
-        for dim in range(k):
-            zg_d_all = Zg[:, dim].float()
-            zp_d_all = Zp[:, dim].float()
-
-            zg_d, zp_d = self._subsample_pair_1d(
-                zg_d_all, zp_d_all, self.trj_quantile_max_points
-            )
-
-            lo = torch.quantile(zg_d, 0.001)
-            hi = torch.quantile(zg_d, 0.999)
-            hi = torch.maximum(hi, lo + torch.tensor(1e-6, device=device, dtype=zg_d.dtype))
-
-            pg = self._soft_histogram_1d(zg_d, lo, hi, self.trj_occ_bins, eps)
-            pp = self._soft_histogram_1d(zp_d, lo, hi, self.trj_occ_bins, eps)
-
-            kl_gp = torch.sum(pg * (torch.log(pg + eps) - torch.log(pp + eps)))
-            kl_pg = torch.sum(pp * (torch.log(pp + eps) - torch.log(pg + eps)))
-            d_occ = 0.5 * (kl_gp + kl_pg)
-            occ_scores.append(self._score_from_distance_torch(d_occ, eps=eps))
-
-        occ_score = torch.stack(occ_scores).mean()
-
-        # ---- Velocity / turning scores ----
-        vg = torch.diff(Zg_seq, dim=1)  # (B, T-1, k)
-        vp = torch.diff(Zp_seq, dim=1)
-
-        speed_g_all = torch.linalg.norm(vg, dim=-1).reshape(-1)
-        speed_p_all = torch.linalg.norm(vp, dim=-1).reshape(-1)
-
-        speed_g, speed_p = self._subsample_pair_1d(
-            speed_g_all, speed_p_all, self.trj_quantile_max_points
-        )
-        speed_distance = self._quantile_distance_torch(
-            speed_g, speed_p, qs=(0.1, 0.3, 0.5, 0.7, 0.9), eps=eps
-        )
-        speed_score = self._score_from_distance_torch(speed_distance, eps=eps)
-
-        # turning cosine between consecutive velocity vectors
-        vg1 = vg[:, 1:, :].reshape(-1, k)
-        vg0 = vg[:, :-1, :].reshape(-1, k)
-        vp1 = vp[:, 1:, :].reshape(-1, k)
-        vp0 = vp[:, :-1, :].reshape(-1, k)
-
-        turn_g_all = torch.sum(vg1 * vg0, dim=-1) / (
-            torch.linalg.norm(vg1, dim=-1) * torch.linalg.norm(vg0, dim=-1) + eps
-        )
-        turn_p_all = torch.sum(vp1 * vp0, dim=-1) / (
-            torch.linalg.norm(vp1, dim=-1) * torch.linalg.norm(vp0, dim=-1) + eps
-        )
-
-        turn_g, turn_p = self._subsample_pair_1d(
-            turn_g_all, turn_p_all, self.trj_quantile_max_points
-        )
-        turn_distance = self._quantile_distance_torch(
-            turn_g, turn_p, qs=(0.1, 0.3, 0.5, 0.7, 0.9), eps=eps
-        )
-        turn_score = self._score_from_distance_torch(turn_distance, eps=eps)
-
-        occ_vel_score = torch.mean(torch.stack([occ_score, speed_score, turn_score]))
-
-        # ---- Path features score (vectorized over batch) ----
-        if T < 5:
-            path_score = torch.zeros((), device=device, dtype=dtype)
-        else:
-            # path length
-            path_g = torch.linalg.norm(vg, dim=-1).sum(dim=1)                      # (B,)
-            path_p = torch.linalg.norm(vp, dim=-1).sum(dim=1)
-
-            # displacement
-            disp_g = torch.linalg.norm(Zg_seq[:, -1, :] - Zg_seq[:, 0, :], dim=-1) # (B,)
-            disp_p = torch.linalg.norm(Zp_seq[:, -1, :] - Zp_seq[:, 0, :], dim=-1)
-
-            # radius
-            radius_g = torch.linalg.norm(
-                Zg_seq - Zg_seq.mean(dim=1, keepdim=True), dim=-1
-            ).mean(dim=1)
-            radius_p = torch.linalg.norm(
-                Zp_seq - Zp_seq.mean(dim=1, keepdim=True), dim=-1
-            ).mean(dim=1)
-
-            # persistence
-            persistence_g = disp_g / (path_g + eps)
-            persistence_p = disp_p / (path_p + eps)
-
-            # lag-1 speed autocorrelation per sequence
-            speed_g_seq = torch.linalg.norm(vg, dim=-1)   # (B, T-1)
-            speed_p_seq = torch.linalg.norm(vp, dim=-1)
-
-            speed_lag1_g = self._batch_corr_score_torch(
-                speed_g_seq[:, 1:], speed_g_seq[:, :-1], eps=eps
-            )
-            speed_lag1_p = self._batch_corr_score_torch(
-                speed_p_seq[:, 1:], speed_p_seq[:, :-1], eps=eps
-            )
-
-            fg = torch.stack(
-                [path_g, disp_g, radius_g, persistence_g, speed_lag1_g], dim=1
-            )  # (B, 5)
-            fp = torch.stack(
-                [path_p, disp_p, radius_p, persistence_p, speed_lag1_p], dim=1
-            )  # (B, 5)
-
-            denom = torch.mean(torch.abs(fg), dim=0) + eps
-            path_distance = torch.mean(torch.abs(fp.mean(dim=0) - fg.mean(dim=0)) / denom)
-            path_score = self._score_from_distance_torch(path_distance, eps=eps)
-
-        trj_score01 = self._weighted_mean_available_torch(
-            {'occupancy_velocity': occ_vel_score, 'path': path_score},
-            {'occupancy_velocity': self.trj_occ_weight, 'path': self.trj_path_weight},
-        )
-
-        trj_loss = 1.0 - trj_score01
-
-        return (
-            trj_loss.to(dtype),
-            trj_score01.to(dtype),
-            occ_vel_score.to(dtype),
-            path_score.to(dtype),
-            occ_score.to(dtype),
-            speed_score.to(dtype),
-            turn_score.to(dtype),
-        )
-
     def forward(self, predictions, targets):
         B, T, V = predictions.shape
         device = predictions.device
         dtype = predictions.dtype
         eps = 1e-6
 
-        mae_raw = self.mae(predictions, targets)
+        err = (predictions - targets).abs()
+        if self.spike_weight_beta > 0.0:
+            # C_dec / deconvolved traces are positive-event dominated after z-scoring:
+            # emphasize positive target excursions, not large negative baselines.
+            w = 1.0 + self.spike_weight_beta * torch.relu(
+                targets - self.spike_z_threshold
+            )
+            spike_mae_raw = (err * w).sum() / w.sum().clamp_min(1e-8)
+        else:
+            spike_mae_raw = err.mean()
+
+        false_positive_raw = torch.zeros((), device=device, dtype=dtype)
+        if self.false_positive_weight > 0.0:
+            inactive = torch.sigmoid((self.false_positive_z_threshold - targets) * 4.0)
+            false_positive_raw = (torch.relu(predictions - self.false_positive_z_threshold) * inactive).mean()
+
+        mae_raw = spike_mae_raw + self.false_positive_weight * false_positive_raw
 
         shape_raw = torch.zeros((), device=device, dtype=dtype)
         deriv_raw = torch.zeros((), device=device, dtype=dtype)
@@ -655,7 +557,6 @@ class CombinedLoss(nn.Module):
         var_raw   = torch.zeros((), device=device, dtype=dtype)
         kl_raw    = torch.zeros((), device=device, dtype=dtype)
         qnt_raw   = torch.zeros((), device=device, dtype=dtype)
-        trj_raw   = torch.zeros((), device=device, dtype=dtype)
 
         kl_mean_raw = torch.zeros((), device=device, dtype=dtype)
         kl_q10_raw = torch.zeros((), device=device, dtype=dtype)
@@ -664,20 +565,12 @@ class CombinedLoss(nn.Module):
         qnt_D_raw = torch.zeros((), device=device, dtype=dtype)
         qnt_score01_raw = torch.zeros((), device=device, dtype=dtype)
 
-        trj_score01_raw = torch.zeros((), device=device, dtype=dtype)
-        trj_occvel_score_raw = torch.zeros((), device=device, dtype=dtype)
-        trj_path_score_raw = torch.zeros((), device=device, dtype=dtype)
-        trj_occ_score_raw = torch.zeros((), device=device, dtype=dtype)
-        trj_speed_score_raw = torch.zeros((), device=device, dtype=dtype)
-        trj_turn_score_raw = torch.zeros((), device=device, dtype=dtype)
-
         need_shape = (self.weights['shape'] != 0) or self.log_all_terms
         need_deriv = (self.weights['deriv'] != 0) or self.log_all_terms
         need_cross = (self.weights['cross'] != 0) or self.log_all_terms
         need_var   = (self.weights['var']   != 0) or self.log_all_terms
         need_kl    = (self.weights['kl']    != 0) or self.log_all_terms
         need_qnt   = (self.weights['qnt']   != 0) or self.log_all_terms
-        need_trj   = (self.weights['trj']   != 0) or self.log_all_terms
 
         if need_shape:
             pred_norm = predictions - predictions.mean(dim=1, keepdim=True)
@@ -689,9 +582,10 @@ class CombinedLoss(nn.Module):
             shape_raw = 1 - corr.mean()
 
         if need_deriv:
-            d_pred = predictions[:, 1:, :] - predictions[:, :-1, :]
-            d_targ = targets[:, 1:, :] - targets[:, :-1, :]
-            deriv_raw = torch.mean(torch.abs(d_pred - d_targ))
+            if T > 1:
+                d_pred = predictions[:, 1:, :] - predictions[:, :-1, :]
+                d_targ = targets[:, 1:, :] - targets[:, :-1, :]
+                deriv_raw = torch.mean(torch.abs(d_pred - d_targ))
 
         if need_cross:
             pred_cov = torch.bmm(predictions.transpose(1, 2), predictions)
@@ -705,6 +599,8 @@ class CombinedLoss(nn.Module):
             bins = [0, T//3, 2*T//3, T]
             var_terms = []
             for a, b in zip(bins[:-1], bins[1:]):
+                if b <= a:
+                    continue
                 ps = pred_ctr[:, a:b, :].std(dim=1, unbiased=False)
                 ts = targ_ctr[:, a:b, :].std(dim=1, unbiased=False)
 
@@ -713,24 +609,14 @@ class CombinedLoss(nn.Module):
                 over  = F.relu(log_ratio)
                 var_terms.append(under.mean() + 0.25 * over.mean())
 
-            var_raw = torch.stack(var_terms).mean()
+            if var_terms:
+                var_raw = torch.stack(var_terms).mean()
 
         if need_kl:
             kl_raw, kl_mean_raw, kl_q10_raw, kl_score01_avg_raw = self._kl_distribution_loss(predictions, targets)
 
         if need_qnt:
             qnt_raw, qnt_D_raw, qnt_score01_raw, _, _ = self._qnt_distribution_loss(predictions, targets)
-
-        if need_trj:
-            (
-                trj_raw,
-                trj_score01_raw,
-                trj_occvel_score_raw,
-                trj_path_score_raw,
-                trj_occ_score_raw,
-                trj_speed_score_raw,
-                trj_turn_score_raw,
-            ) = self._trajectory_distribution_loss(predictions, targets)
 
         if not self.initialized and self.training:
             self.running_norms[0] = mae_raw.detach() + 1e-8
@@ -740,7 +626,6 @@ class CombinedLoss(nn.Module):
             self.running_norms[4] = (var_raw.detach()   + 1e-8) if need_var   else torch.tensor(1.0, device=device)
             self.running_norms[5] = (kl_raw.detach()    + 1e-8) if need_kl    else torch.tensor(1.0, device=device)
             self.running_norms[6] = (qnt_raw.detach()   + 1e-8) if need_qnt   else torch.tensor(1.0, device=device)
-            self.running_norms[7] = (trj_raw.detach()   + 1e-8) if need_trj   else torch.tensor(1.0, device=device)
             self.initialized = True
 
         total = self.weights['mae'] * (mae_raw / self.running_norms[0])
@@ -756,8 +641,6 @@ class CombinedLoss(nn.Module):
             total = total + self.weights['kl'] * (kl_raw / self.running_norms[5])
         if self.weights['qnt'] != 0:
             total = total + self.weights['qnt'] * (qnt_raw / self.running_norms[6])
-        if self.weights['trj'] != 0:
-            total = total + self.weights['trj'] * (trj_raw / self.running_norms[7])
 
         loss_dict_norm = {
             'mae':   (mae_raw   / self.running_norms[0]),
@@ -767,7 +650,6 @@ class CombinedLoss(nn.Module):
             'var':   (var_raw   / self.running_norms[4]) if need_var   else torch.zeros((), device=device),
             'kl':    (kl_raw    / self.running_norms[5]) if need_kl    else torch.zeros((), device=device),
             'qnt':   (qnt_raw   / self.running_norms[6]) if need_qnt   else torch.zeros((), device=device),
-            'trj':   (trj_raw   / self.running_norms[7]) if need_trj   else torch.zeros((), device=device),
             'total': total
         }
 
@@ -787,14 +669,6 @@ class CombinedLoss(nn.Module):
             'qnt_D': qnt_D_raw if need_qnt else torch.zeros((), device=device),
             'qnt_score01': qnt_score01_raw if need_qnt else torch.zeros((), device=device),
 
-            'trj': trj_raw if need_trj else torch.zeros((), device=device),
-            'trj_score01': trj_score01_raw if need_trj else torch.zeros((), device=device),
-            'trj_occvel_score': trj_occvel_score_raw if need_trj else torch.zeros((), device=device),
-            'trj_path_score': trj_path_score_raw if need_trj else torch.zeros((), device=device),
-            'trj_occ_score': trj_occ_score_raw if need_trj else torch.zeros((), device=device),
-            'trj_speed_score': trj_speed_score_raw if need_trj else torch.zeros((), device=device),
-            'trj_turn_score': trj_turn_score_raw if need_trj else torch.zeros((), device=device),
-
             'total': total,
         }
 
@@ -810,9 +684,8 @@ def build_loss(config):
             cross_weight=config.get('loss_cross_weight', 0.0),
             var_weight=config.get('loss_var_weight', 0.0),
 
-            kl_weight=config.get('loss_kl_weight', 0.02),
-            qnt_weight=config.get('loss_qnt_weight', 0.08),
-            trj_weight=config.get('loss_trj_weight', 0.03),
+            kl_weight=config.get('loss_kl_weight', 0.0),
+            qnt_weight=config.get('loss_qnt_weight', 0.0),
 
             log_all_terms=config.get('log_all_loss_terms', True),
 
@@ -831,15 +704,10 @@ def build_loss(config):
             qnt_top_q_regions=config.get('loss_qnt_top_q_regions', 0.25),
             qnt_eps=config.get('loss_qnt_eps', 1e-8),
 
-            trj_eps=config.get('loss_trj_eps', 1e-8),
-            trj_pca_k_max=config.get('loss_trj_pca_k_max', 4),
-            trj_occ_bins=config.get('loss_trj_occ_bins', 12),
-            trj_occ_weight=config.get('loss_trj_occ_weight', 0.60),
-            trj_path_weight=config.get('loss_trj_path_weight', 0.40),
-
-            # NEW TRJ-only speed knobs
-            trj_fit_max_points=config.get('loss_trj_fit_max_points', 4096),
-            trj_quantile_max_points=config.get('loss_trj_quantile_max_points', 8192),
+            spike_weight_beta=config.get('loss_spike_weight_beta', 0.0),
+            spike_z_threshold=config.get('loss_spike_z_threshold', 2.0),
+            false_positive_weight=config.get('loss_false_positive_weight', 0.0),
+            false_positive_z_threshold=config.get('loss_false_positive_z_threshold', 0.5),
         )
     
 def plot_learning_curves(train_history, val_history, save_dir):
@@ -1247,6 +1115,13 @@ def train_single_mode(base_config, train_loader, val_loader, device, mode_tag, m
     ckpt_first = config.get('checkpoint_first_epoch', 5)
     ckpt_every = config.get('checkpoint_every', 25)
 
+    # Load TF pretrained weights as starting point
+    """pretrain_path = Path("checkpoints_TF/best_model.pt")
+    if pretrain_path.exists():
+        ckpt = torch.load(pretrain_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        print(f"[INFO] Loaded TF pretrained weights")"""
+
     for epoch in range(1, config['num_epochs'] + 1):
         current_p = 0.5
         criterion.weights['mae'] = 1.0
@@ -1448,6 +1323,113 @@ def train_single_mode(base_config, train_loader, val_loader, device, mode_tag, m
     }
 
 
+def _allocate_split_counts(n_items, train_ratio, val_ratio, test_ratio):
+    """Allocate n_items to train/val/test with ratio matching and minimum presence when possible."""
+    ratios = np.array([train_ratio, val_ratio, test_ratio], dtype=np.float64)
+    raw = ratios * n_items
+    counts = np.floor(raw).astype(int)
+    remainder = int(n_items - counts.sum())
+
+    if remainder > 0:
+        frac = raw - counts
+        order = np.argsort(-frac)
+        for i in order[:remainder]:
+            counts[i] += 1
+
+    # If enough items, ensure each split gets at least one item
+    # so early/mid/late bins can be represented everywhere.
+    if n_items >= 3 and np.all(ratios > 0):
+        for i in range(3):
+            if counts[i] == 0:
+                donor = int(np.argmax(counts))
+                if counts[donor] > 1:
+                    counts[donor] -= 1
+                    counts[i] += 1
+
+    # Final guard to keep exact total
+    diff = int(n_items - counts.sum())
+    if diff != 0:
+        counts[0] += diff
+
+    return int(counts[0]), int(counts[1]), int(counts[2])
+
+
+def split_examples_temporal_stratified_train_val_test(
+    examples,
+    sequence_indices,
+    train_ratio=0.8,
+    val_ratio=0.1,
+    test_ratio=0.1,
+    random_seed=42,
+):
+    """
+    Split examples into train/val/test while mixing early/mid/late subsequences in all splits.
+
+    For each sequence:
+      - keep subsequence order using flattened example index order
+      - split ordered subsequences into 3 temporal bins: beginning/middle/end
+      - randomly assign subsequences within each bin to train/val/test
+    """
+    total_ratio = train_ratio + val_ratio + test_ratio
+    if not np.isclose(total_ratio, 1.0):
+        raise ValueError(
+            f"train/val/test ratios must sum to 1.0, got "
+            f"{train_ratio} + {val_ratio} + {test_ratio} = {total_ratio}"
+        )
+
+    rng = np.random.default_rng(random_seed)
+    unique_sequences = np.unique(sequence_indices)
+
+    train_idx_parts = []
+    val_idx_parts = []
+    test_idx_parts = []
+
+    for seq_id in unique_sequences:
+        seq_flat_idx = np.where(sequence_indices == seq_id)[0]
+        seq_flat_idx = np.sort(seq_flat_idx)
+        temporal_bins = np.array_split(seq_flat_idx, 3)
+
+        for bin_idx in temporal_bins:
+            n_bin = len(bin_idx)
+            if n_bin == 0:
+                continue
+
+            shuffled = rng.permutation(bin_idx)
+            n_train, n_val, n_test = _allocate_split_counts(
+                n_bin, train_ratio, val_ratio, test_ratio
+            )
+
+            train_idx_parts.append(shuffled[:n_train])
+            val_idx_parts.append(shuffled[n_train:n_train + n_val])
+            test_idx_parts.append(shuffled[n_train + n_val:n_train + n_val + n_test])
+
+    train_idx = np.sort(np.concatenate(train_idx_parts)) if train_idx_parts else np.array([], dtype=int)
+    val_idx = np.sort(np.concatenate(val_idx_parts)) if val_idx_parts else np.array([], dtype=int)
+    test_idx = np.sort(np.concatenate(test_idx_parts)) if test_idx_parts else np.array([], dtype=int)
+
+    train_examples = examples[train_idx]
+    val_examples = examples[val_idx]
+    test_examples = examples[test_idx]
+    train_seq_indices = sequence_indices[train_idx]
+    val_seq_indices = sequence_indices[val_idx]
+    test_seq_indices = sequence_indices[test_idx]
+
+    print("\nTemporal-stratified split (beginning/middle/end mixed in all splits):")
+    print(f"  Total examples: {len(examples)}")
+    print(f"  Train: {len(train_examples)} ({100 * len(train_examples) / max(1, len(examples)):.1f}%)")
+    print(f"  Val:   {len(val_examples)} ({100 * len(val_examples) / max(1, len(examples)):.1f}%)")
+    print(f"  Test:  {len(test_examples)} ({100 * len(test_examples) / max(1, len(examples)):.1f}%)")
+
+    return (
+        train_examples,
+        val_examples,
+        test_examples,
+        train_seq_indices,
+        val_seq_indices,
+        test_seq_indices,
+    )
+
+
 
 def main():
     """Main training function."""
@@ -1467,19 +1449,19 @@ def main():
 
     # Configuration (matching netho-hp-search-9-run-2.yaml)
     config = {
-        'data_path': 'data_processed/data2p_A_3_1189451_S10_F_dff_10Hz.npy', #'data_processed/data100_ba16.npy',
-        'T_in': 30, #90,
-        'T_out': 30, #90,
-        'n_vars': 16,
-        'd_model': 64,           # model_spec.d_model
+        'data_path': 'data_processed/data2p_A_3_1189451_S10_C_dec_10Hz.npy', #'data_processed/data100_ba16.npy',
+        'T_in': 90, #90,
+        'T_out': 90, #90,
+        'n_vars': 88,
+        'd_model': 256,           # model_spec.d_model
         'n_heads': 8,            # model_spec.nhead
-        'n_layers': 8,           # model_spec.nlayers
-        'd_ff': 128,             # model_spec.d_hid (feedforward dimension)
-        'dropout': 0.05,       # training_spec.dropout
+        'n_layers': 4,           # model_spec.nlayers
+        'd_ff': 256,             # model_spec.d_hid (feedforward dimension)
+        'dropout': 0.1,       # training_spec.dropout
         'patch_len': 1,          # Number of time-steps per patch (Timer-XL style)
-        'effective_batch_size': 2000, #2000,  # Original batch size from YAML (effective via accumulation)
-        'batch_size': 1024,#2048, #512,        # Physical batch size (teacher forcing is memory efficient)
-        'accumulation_steps': 2, #4,  # 64 * 32 ≈ 2048 effective batch size
+        'effective_batch_size': 32, #2000,  # Original batch size from YAML (effective via accumulation)
+        'batch_size': 32, #2048, #512,        # Physical batch size (teacher forcing is memory efficient)
+        'accumulation_steps': 1, #4,  # 64 * 32 ≈ 2048 effective batch size
         'use_mixed_precision': True,  # Use FP16 to reduce memory by ~50%
         'loss_type': 'combined',
         'loss_mae_weight': 1.0,
@@ -1487,14 +1469,24 @@ def main():
         'loss_deriv_weight': 0.0,  # Moderate weight to force smooth transitions
         'loss_cross_weight': 0.0,  # Low weight to maintain population structure
         'loss_var_weight': 0.0,
+        # Robust z-score + spike-weighted MAE (targets are normalized)
+        'norm_eps': 1e-5,
+        'norm_std_floor_abs': 1e-4,
+        'norm_std_floor_frac_median': 0.25,
+        'loss_spike_weight_beta': 2.0,
+        'loss_spike_z_threshold': 1.5,
+        'loss_false_positive_weight': 0.5,
+        'loss_false_positive_z_threshold': 1.0,
         'learning_rate': 1e-4,    # training_spec.lr (will use scheduler instead)
         'max_lr': 0.0003,         # scheduler.max_lr
         'num_epochs': 150, #150 ,     # training_spec.epochs
         'train_ratio': 0.8,
+        'val_ratio': 0.1,
+        'test_ratio': 0.1,
         'random_seed': 101,      # seed from YAML
         'save_dir': 'checkpoints',
         'plot_dir': 'evaluation',
-        'log_all_loss_terms': True,      # <-- NEW (so mae/shape/deriv/cross/var are computed even if weights=0)
+        'log_all_loss_terms': False,
         'checkpoint_first_epoch': 5,     # <-- NEW
         'checkpoint_every': 25, 
         'save_every': 15,       # training_spec.iter_save
@@ -1507,7 +1499,7 @@ def main():
         'scheduler_div_factor': 25,           # Start at max_lr / 25
         'scheduler_final_div_factor': 100,    # End at max_lr / 100 (keep it higher)
         'scheduler_anneal_strategy': 'cos',
-        'use_torch_compile': True,
+        'use_torch_compile': False,
     }
     
     # Print configuration summary
@@ -1559,6 +1551,13 @@ def main():
     print("PREPARING DATA")
     print("="*80)
     data_array = load_data(config['data_path'])
+    data_n_vars = int(data_array.shape[2])
+    if config.get('n_vars') != data_n_vars:
+        print(
+            f"[INFO] Overriding n_vars from {config.get('n_vars')} to {data_n_vars} "
+            f"to match loaded data shape."
+        )
+        config['n_vars'] = data_n_vars
     examples, sequence_indices = reshape_to_examples(data_array)
     
     # Free the original data array from memory
@@ -1572,10 +1571,15 @@ def main():
         T_out=config['T_out']
     )
     
-    train_examples, val_examples, train_seq_indices, val_seq_indices = split_by_sequences(
-        examples, sequence_indices, 
-        train_ratio=config['train_ratio'], 
-        random_seed=config['random_seed']
+    train_examples, val_examples, test_examples, train_seq_indices, val_seq_indices, test_seq_indices = (
+        split_examples_temporal_stratified_train_val_test(
+            examples,
+            sequence_indices,
+            train_ratio=config['train_ratio'],
+            val_ratio=config['val_ratio'],
+            test_ratio=config['test_ratio'],
+            random_seed=config['random_seed'],
+        )
     )
 
 
@@ -1590,28 +1594,48 @@ def main():
     stats_npy = proc_root / f"train_norm_stats_{run_stem}.npy"
     val_npy = proc_root / f"processed_val_{run_stem}.npy"
     val_seq_npy = proc_root / f"processed_val_seq_indices_{run_stem}.npy"
+    test_npy = proc_root / f"processed_test_{run_stem}.npy"
+    test_seq_npy = proc_root / f"processed_test_seq_indices_{run_stem}.npy"
 
-    train_examples, val_examples, test_examples, norm = normalize_after_split_input_only(
+    train_examples, val_examples, test_examples, norm = normalize_split_robust_2p(
         train_examples,
         val_examples,
+        test_examples,
         T_in=config["T_in"],
-        eps=1e-6,
-        save_stats_path=str(stats_npy),   # this writes _mean/_std
+        eps=float(config["norm_eps"]),
+        floor_abs=float(config["norm_std_floor_abs"]),
+        floor_frac_median=float(config["norm_std_floor_frac_median"]),
+        save_stats_path=str(stats_npy),
     )
 
     np.save(val_npy, val_examples)  # normalized val
     np.save(val_seq_npy, val_seq_indices.astype(np.int64, copy=False))
+    np.save(test_npy, test_examples)  # normalized test
+    np.save(test_seq_npy, test_seq_indices.astype(np.int64, copy=False))
 
     config["normalization_stats_base"] = str(stats_npy.with_suffix("").resolve())
     config["processed_val_examples_path"] = str(val_npy.resolve())
     config["processed_val_seq_indices_path"] = str(val_seq_npy.resolve())
-
+    config["processed_test_examples_path"] = str(test_npy.resolve())
+    config["processed_test_seq_indices_path"] = str(test_seq_npy.resolve())
     
     # Free examples array after splitting
     del examples, sequence_indices
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     # Create dataloaders
+    # Guard for small datasets: create_dataloaders uses drop_last=True for train,
+    # so batch_size must not exceed number of train examples or we get 0 train batches.
+    if len(train_examples) == 0:
+        raise ValueError("No training examples after split/filtering. Cannot train.")
+    effective_batch_size = int(min(config['batch_size'], len(train_examples)))
+    if effective_batch_size < config['batch_size']:
+        print(
+            f"[INFO] Reducing batch_size from {config['batch_size']} to {effective_batch_size} "
+            f"to avoid zero training batches on this dataset."
+        )
+    config['batch_size'] = effective_batch_size
+
     train_loader, val_loader = create_dataloaders(
         train_examples,
         val_examples,
@@ -1625,10 +1649,10 @@ def main():
     
     # Train both modes sequentially
     training_variants = [
-        {'tag': 'AR_KV', 'label': 'KV Autoregressive'},
+        #{'tag': 'AR_KV', 'label': 'KV Autoregressive'},
         #{'tag': 'MIX_TF_AR_KV', 'label': 'Mixed Teacher Forcing and Autoregressive'},
         #{'tag': 'AR', 'label': 'Autoregressive'},
-        #{'tag': 'TF', 'label': 'Teacher Forcing'},
+        {'tag': 'TF', 'label': 'Teacher Forcing'},
     ]
 
     

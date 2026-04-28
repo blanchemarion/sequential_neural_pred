@@ -23,3 +23,9 @@ checkpoints_TF_QTL_0.08_KL_0.02_MOM_0.03/
 checkpoints_TF_QTL_0.08_KL_0.02_TRJ_0.03/
 checkpoints_TF_scaling/
 checkpoints_TF_mix_scaling/
+checkpoints_1_step_scaling/
+checkpoints_AR_scaling/
+output/
+checkpoints_AR_KV/
+checkpoints_TF/
+checkpoints_TF_dff/

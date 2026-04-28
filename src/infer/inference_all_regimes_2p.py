@@ -53,10 +53,10 @@ LONG_PRED_LENGTH = 420  # Fixed prediction length for long window
 SEEDS = [102] #[102, 103, 104]
 
 
-MODES = ["AR_KV"]
-MODE_COLORS = {"AR_KV": "#2E86AB"}
-#MODES = ["TF"]
-#MODE_COLORS = {"TF": "#2E86AB"}
+#MODES = ["AR_KV"]
+#MODE_COLORS = {"AR_KV": "#2E86AB"}
+MODES = ["TF"]
+MODE_COLORS = {"TF": "#2E86AB"}
 #MODES = ["1_step"]
 #MODE_COLORS = {"1_step": "#2E86AB"}
 #MODES = ["TF_QTL_0.1"]
@@ -833,8 +833,8 @@ def main():
     SELECTED_CHECKPOINTS = [
         {
             "config_name": "60_1",
-            "AR_KV": "checkpoints_AR_KV",
-            #"TF": "checkpoints_TF",
+            #"AR_KV": "checkpoints_AR_KV",
+            "TF": "checkpoints_TF",
             #"TF_QTL_0.1": "checkpoints_TF_QTL_0.1",
             #"TF_QTL_0.08_KL_0.02": "checkpoints_TF_QTL_0.08_KL_0.02",
             #"TF_QTL_0.08_KL_0.02_MOM_0.03": "checkpoints_TF_QTL_0.08_KL_0.02_MOM_0.03",

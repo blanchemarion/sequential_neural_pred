@@ -447,7 +447,7 @@ def main() -> None:
     parser.add_argument(
         "--window-length",
         type=int,
-        default=180,
+        default=91,
         help="Subsequence/window length in timepoints (default: 120).",
     )
     parser.add_argument(

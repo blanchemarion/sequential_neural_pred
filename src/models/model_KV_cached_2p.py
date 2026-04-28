@@ -201,7 +201,9 @@ class TransformerModel(nn.Module):
         if not self.nonnegative_output:
             return out
         if self.output_activation == "softplus":
-            return F.softplus(out)
+            # Plain softplus has floor softplus(0)=ln(2)~0.693, which can create
+            # artificial jumps/plateaus at rollout start. Zero-center then clamp.
+            return (F.softplus(out) - 0.6931471805599453).clamp_min(0.0)
         if self.output_activation == "relu":
             return F.relu(out)
         if self.output_activation == "clamp":

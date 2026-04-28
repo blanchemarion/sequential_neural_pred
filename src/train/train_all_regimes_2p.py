@@ -116,6 +116,9 @@ def normalize_split_robust_2p(
 
 def summarize_continuous_split(name: str, arr: np.ndarray, near_zero_eps: float = 1e-8) -> None:
     v = arr.reshape(-1)
+    if v.size == 0:
+        print(f"[{name}] empty target slice (check T_in/T_out vs example length).")
+        return
     print(
         f"[{name}] min={float(np.min(v)):.6g} max={float(np.max(v)):.6g} "
         f"mean={float(np.mean(v)):.6g} std={float(np.std(v)):.6g}"
@@ -1442,12 +1445,12 @@ def main():
         save_stats_path=None if str(config.get("normalization_mode", "robust_zscore")).lower() == "none" else str(stats_npy),
     )
 
-    summarize_continuous_split("train_targets", train_examples[:, config["T_in"]:config["T_in"] + config["T_out"], :])
-    summarize_continuous_split("val_targets", val_examples[:, config["T_in"]:config["T_in"] + config["T_out"], :])
-    summarize_continuous_split("test_targets", test_examples[:, config["T_in"]:config["T_in"] + config["T_out"], :])
+    summarize_continuous_split("train_targets", train_examples[:, :, config["T_in"]:config["T_in"] + config["T_out"]])
+    summarize_continuous_split("val_targets", val_examples[:, :, config["T_in"]:config["T_in"] + config["T_out"]])
+    summarize_continuous_split("test_targets", test_examples[:, :, config["T_in"]:config["T_in"] + config["T_out"]])
 
     # Derive robust thresholds/scales from training targets for onset/peak weighting.
-    train_targets = train_examples[:, config["T_in"]:config["T_in"] + config["T_out"], :]
+    train_targets = train_examples[:, :, config["T_in"]:config["T_in"] + config["T_out"]]
     pos_vals = train_targets[train_targets > 0]
     if pos_vals.size > 0:
         config["loss_spike_weight_scale"] = float(np.quantile(pos_vals, config.get("loss_spike_weight_scale_quantile", 0.95)))
@@ -1457,11 +1460,11 @@ def main():
         config["loss_high_target_threshold"] = 1.0
 
     # Onset threshold from positive derivatives if requested.
-    context_last_np = train_examples[:, config["T_in"] - 1:config["T_in"], :]
-    dy0 = train_targets[:, 0:1, :] - context_last_np
-    if train_targets.shape[1] > 1:
-        dyn = train_targets[:, 1:, :] - train_targets[:, :-1, :]
-        dy = np.concatenate([dy0, dyn], axis=1)
+    context_last_np = train_examples[:, :, config["T_in"] - 1:config["T_in"]]
+    dy0 = train_targets[:, :, 0:1] - context_last_np
+    if train_targets.shape[2] > 1:
+        dyn = train_targets[:, :, 1:] - train_targets[:, :, :-1]
+        dy = np.concatenate([dy0, dyn], axis=2)
     else:
         dy = dy0
     pos_dy = dy[dy > 0]

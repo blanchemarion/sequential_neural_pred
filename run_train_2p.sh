@@ -80,7 +80,8 @@ python -c "import torch; print('torch', torch.__version__); print('torch cuda', 
 
 # ---- run steps (relative paths OK because we cd'ed into PROJECT_DIR) ----
 echo "[INFO] Running pipeline..."
-time python src/prepare/prepare_2p_traces.py
-time python src/train/train_all_regimes_2p.py
+#time python src/prepare/prepare_2p_traces.py
+#time python src/train/train_all_regimes_2p.py
+time python src/infer/inference_all_regimes_2p.py
 
 echo "[INFO] Done at $(date)"

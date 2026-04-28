@@ -144,6 +144,8 @@ class TransformerModel(nn.Module):
         dropout=0.1,
         T_in=70,
         T_out=21,
+        nonnegative_output: bool = True,
+        output_activation: str = "softplus",
     ):
         super().__init__()
 
@@ -152,6 +154,8 @@ class TransformerModel(nn.Module):
         self.T_out = T_out
         self.d_model = d_model
         d_ff = d_ff or 4 * d_model
+        self.nonnegative_output = bool(nonnegative_output)
+        self.output_activation = str(output_activation).lower()
 
         # Total token positions per (history + future) block
         self.total_tokens = T_in + T_out
@@ -193,7 +197,18 @@ class TransformerModel(nn.Module):
         # Start from a persistence baseline, then learn deviations. This strongly
         # reduces arbitrary oscillatory rollouts on sparse spike-like traces.
         decay = torch.sigmoid(self.residual_decay_logit)
-        return decay * prev_values + self.out_proj(h)
+        out = decay * prev_values + self.out_proj(h)
+        if not self.nonnegative_output:
+            return out
+        if self.output_activation == "softplus":
+            return F.softplus(out)
+        if self.output_activation == "relu":
+            return F.relu(out)
+        if self.output_activation == "clamp":
+            return out.clamp_min(0.0)
+        if self.output_activation == "identity":
+            return out
+        raise ValueError(f"Unknown output_activation: {self.output_activation}")
 
     def _positions_block_relative(self, L: int, start_in_block: int, device):
         pos = torch.arange(L, device=device) + start_in_block
@@ -397,8 +412,19 @@ class TransformerModel(nn.Module):
 
 
 
-def create_model_cached(n_vars=16, d_model=64, n_heads=4, n_layers=4, d_ff=None, dropout=0.1,
-                 T_in=70, T_out=21, device='cpu'):
+def create_model_cached(
+    n_vars=16,
+    d_model=64,
+    n_heads=4,
+    n_layers=4,
+    d_ff=None,
+    dropout=0.1,
+    T_in=70,
+    T_out=21,
+    device='cpu',
+    nonnegative_output=True,
+    output_activation="softplus",
+):
 
     model = TransformerModel(
         n_vars=n_vars,
@@ -409,6 +435,8 @@ def create_model_cached(n_vars=16, d_model=64, n_heads=4, n_layers=4, d_ff=None,
         dropout=dropout,
         T_in=T_in,
         T_out=T_out,
+        nonnegative_output=nonnegative_output,
+        output_activation=output_activation,
     ).to(device)
 
     return model

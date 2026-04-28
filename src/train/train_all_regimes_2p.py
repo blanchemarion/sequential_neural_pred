@@ -16,6 +16,7 @@ import sys
 import math
 import os
 import json
+import argparse
 
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent
@@ -60,12 +61,18 @@ def normalize_split_robust_2p(
     eps: float,
     floor_abs: float,
     floor_frac_median: float,
+    normalization_mode: str = "robust_zscore",
     save_stats_path: str | None = None,
 ):
     """
     Train-only input-window mean/std (same as preprocess_helpers), then robust std floor, then z-score.
     Saves *_mean.npy / *_std.npy / *_meta.json compatible with inference loaders.
     """
+    mode = str(normalization_mode).lower()
+    if mode == "none":
+        print("[norm 2p] normalization_mode=none -> using raw continuous traces")
+        return train_examples, val_examples, test_examples, (None, None, "none")
+
     mean, std = compute_train_stats_input_only(train_examples, T_in=T_in, eps=eps)
     std, floor_used, med_before = apply_robust_std_floor_numpy(
         std, eps=eps, floor_abs=floor_abs, floor_frac_median=floor_frac_median
@@ -105,6 +112,23 @@ def normalize_split_robust_2p(
         print(f"  Meta: {meta_path}")
 
     return train_norm, val_norm, test_norm, (mean, std, "NCT_robust")
+
+
+def summarize_continuous_split(name: str, arr: np.ndarray, near_zero_eps: float = 1e-8) -> None:
+    v = arr.reshape(-1)
+    print(
+        f"[{name}] min={float(np.min(v)):.6g} max={float(np.max(v)):.6g} "
+        f"mean={float(np.mean(v)):.6g} std={float(np.std(v)):.6g}"
+    )
+    zero_frac = float(np.mean(v == 0))
+    near_zero_frac = float(np.mean(np.abs(v) <= near_zero_eps))
+    neg_frac = float(np.mean(v < 0))
+    print(
+        f"[{name}] frac_zero={zero_frac:.4f} frac_near_zero(|x|<={near_zero_eps:g})={near_zero_frac:.4f} "
+        f"frac_negative={neg_frac:.4f}"
+    )
+    if neg_frac > 0:
+        print(f"[WARNING] {name} contains negative target values ({100*neg_frac:.2f}%).")
 
 
 # =========================
@@ -241,473 +265,145 @@ def build_loss(config):
 class CombinedLoss(nn.Module):
     def __init__(
         self,
-        mae_weight=1.0,
-        shape_weight=0.0,
-        deriv_weight=0.0,
-        cross_weight=0.0,
-        var_weight=0.0,
-        kl_weight=0.0,
-        qnt_weight=0.0,
-        log_all_terms: bool = True,
-        kl_bins: int = 33,
-        kl_eps: float = 1e-8,
-        kl_support_low: float = 0.001,
-        kl_support_high: float = 0.999,
-        kl_use_q10: bool = True,
-        kl_q10_weight: float = 0.5,
-        qnt_q_lo: float = 0.01,
-        qnt_q_hi: float = 0.99,
-        qnt_n_q: int = 99,
-        qnt_tail_lo: float = 0.10,
-        qnt_tail_hi: float = 0.90,
-        qnt_top_q_regions: float = 0.25,
-        qnt_eps: float = 1e-8,
-        spike_weight_beta: float = 0.0,
-        spike_z_threshold: float = 2.0,
-        false_positive_weight: float = 0.0,
-        false_positive_z_threshold: float = 0.5,
+        loss_spike_weight_beta=4.0,
+        loss_spike_weight_scale=1.0,
+        loss_spike_weight_clip=10.0,
+        loss_onset_weight=3.0,
+        loss_onset_threshold=0.1,
+        loss_onset_min_target=0.0,
+        loss_onset_value_weight=1.0,
+        loss_underprediction_weight=1.0,
+        loss_high_target_threshold=0.5,
+        loss_false_positive_weight=0.1,
+        loss_false_positive_threshold=0.5,
+        eps=1e-8,
     ):
         super().__init__()
-        self.weights = {
-            'mae': mae_weight,
-            'shape': shape_weight,
-            'deriv': deriv_weight,
-            'cross': cross_weight,
-            'var': var_weight,
-            'kl': kl_weight,
-            'qnt': qnt_weight,
-        }
-        self.log_all_terms = log_all_terms
-        self.mae = nn.L1Loss()
+        self.loss_spike_weight_beta = float(loss_spike_weight_beta)
+        self.loss_spike_weight_scale = float(max(loss_spike_weight_scale, eps))
+        self.loss_spike_weight_clip = float(max(loss_spike_weight_clip, 1.0))
+        self.loss_onset_weight = float(loss_onset_weight)
+        self.loss_onset_threshold = float(loss_onset_threshold)
+        self.loss_onset_min_target = float(loss_onset_min_target)
+        self.loss_onset_value_weight = float(loss_onset_value_weight)
+        self.loss_underprediction_weight = float(loss_underprediction_weight)
+        self.loss_high_target_threshold = float(loss_high_target_threshold)
+        self.loss_false_positive_weight = float(loss_false_positive_weight)
+        self.loss_false_positive_threshold = float(loss_false_positive_threshold)
+        self.eps = float(eps)
 
-        # KL params
-        self.kl_bins = kl_bins
-        self.kl_eps = kl_eps
-        self.kl_support_low = kl_support_low
-        self.kl_support_high = kl_support_high
-        self.kl_use_q10 = kl_use_q10
-        self.kl_q10_weight = kl_q10_weight
+    def _masked_mae(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        denom = mask.float().sum()
+        if float(denom.item()) <= 0:
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
+        return (torch.abs(pred - target) * mask.float()).sum() / denom.clamp_min(self.eps)
 
-        # QNT params
-        self.qnt_q_lo = qnt_q_lo
-        self.qnt_q_hi = qnt_q_hi
-        self.qnt_n_q = qnt_n_q
-        self.qnt_tail_lo = qnt_tail_lo
-        self.qnt_tail_hi = qnt_tail_hi
-        self.qnt_top_q_regions = qnt_top_q_regions
-        self.qnt_eps = qnt_eps
-
-        # Spike-weighted MAE (targets assumed z-scored): upweight |target| > threshold
-        self.spike_weight_beta = float(spike_weight_beta)
-        self.spike_z_threshold = float(spike_z_threshold)
-        self.false_positive_weight = float(false_positive_weight)
-        self.false_positive_z_threshold = float(false_positive_z_threshold)
-
-        # mae, shape, deriv, cross, var, kl, qnt
-        self.register_buffer('running_norms', torch.ones(8))
-        self.initialized = False
-
-    def _soft_histogram_probs(self, x, lo, hi, bins, eps):
+    def forward(self, predictions, targets, context_last=None):
         """
-        x:  (B, T, V)
-        lo: (V,)
-        hi: (V,)
-        returns probs: (B, V, K)
+        predictions, targets: (B, T, C)
+        context_last: (B, C) or (B, 1, C)
         """
-        B, T, V = x.shape
-        device = x.device
-        dtype = x.dtype
-        K = bins
-
-        widths = (hi - lo).clamp_min(1e-6) / K
-        centers = lo.unsqueeze(-1) + (torch.arange(K, device=device, dtype=dtype) + 0.5) * widths.unsqueeze(-1)
-
-        x_exp = x.unsqueeze(-1)                    # (B, T, V, 1)
-        c_exp = centers.unsqueeze(0).unsqueeze(0) # (1, 1, V, K)
-
-        sigma = 0.5 * widths
-        sigma_exp = sigma.unsqueeze(0).unsqueeze(0).unsqueeze(-1)  # (1, 1, V, 1)
-
-        weights = torch.exp(-0.5 * ((x_exp - c_exp) / sigma_exp) ** 2)
-        probs = weights.sum(dim=1)  # (B, V, K)
-        probs = probs + eps
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        return probs
-
-    def _soft_histogram_1d(self, x, lo, hi, bins, eps):
-        """
-        x: (N,)
-        returns probs: (K,)
-        """
-        x = x.reshape(-1)
-        dtype = x.dtype
-        device = x.device
-
-        lo = torch.as_tensor(lo, device=device, dtype=dtype)
-        hi = torch.as_tensor(hi, device=device, dtype=dtype)
-        width = (hi - lo).clamp_min(1e-6) / bins
-        centers = lo + (torch.arange(bins, device=device, dtype=dtype) + 0.5) * width
-        sigma = 0.5 * width
-
-        w = torch.exp(-0.5 * ((x[:, None] - centers[None, :]) / sigma) ** 2)
-        probs = w.sum(dim=0) + eps
-        probs = probs / probs.sum()
-        return probs
-
-    def _score_from_distance_torch(self, distance, eps=1e-8):
-        return 1.0 / (1.0 + torch.clamp(distance, min=0.0))
-
-    def _corr_score_torch(self, x, y, eps=1e-8):
-        x = x.reshape(-1)
-        y = y.reshape(-1)
-        x = x - x.mean()
-        y = y - y.mean()
-        denom = torch.sqrt((x * x).sum() + eps) * torch.sqrt((y * y).sum() + eps)
-        return (x * y).sum() / denom
-
-    def _batch_corr_score_torch(self, x, y, eps=1e-8):
-        """
-        x, y: (B, T)
-        returns: (B,)
-        """
-        x = x - x.mean(dim=1, keepdim=True)
-        y = y - y.mean(dim=1, keepdim=True)
-        denom = torch.sqrt((x * x).sum(dim=1) + eps) * torch.sqrt((y * y).sum(dim=1) + eps)
-        return (x * y).sum(dim=1) / denom
-
-    def _quantile_distance_torch(self, x, y, qs, eps=1e-8):
-        x = x.float().reshape(-1)
-        y = y.float().reshape(-1)
-        q = torch.tensor(qs, device=x.device, dtype=x.dtype)
-        qx = torch.quantile(x, q)
-        qy = torch.quantile(y, q)
-        denom = torch.mean(torch.abs(qx)) + eps
-        return torch.mean(torch.abs(qx - qy) / denom)
-
-    def _weighted_mean_available_torch(self, values, weights):
-        """
-        values: dict[str, scalar tensor]
-        weights: dict[str, float]
-        """
-        num = None
-        den = 0.0
-        for key, value in values.items():
-            w = float(weights.get(key, 0.0))
-            if w <= 0:
-                continue
-            if num is None:
-                num = value * w
-            else:
-                num = num + value * w
-            den += w
-        if num is None or den <= 0:
-            return torch.tensor(float('nan'), device=next(iter(values.values())).device)
-        return num / den
-
-    def _subsample_rows(self, x, max_points):
-        """
-        x: (N, D)
-        returns: (min(N, max_points), D)
-        """
-        if max_points is None or max_points <= 0 or x.shape[0] <= max_points:
-            return x
-        idx = torch.randperm(x.shape[0], device=x.device)[:max_points]
-        return x.index_select(0, idx)
-
-    def _subsample_pair_1d(self, x, y, max_points):
-        """
-        x, y: (N,)
-        returns same-index subsample of both
-        """
-        x = x.reshape(-1)
-        y = y.reshape(-1)
-        n = x.shape[0]
-        if max_points is None or max_points <= 0 or n <= max_points:
-            return x, y
-        idx = torch.randperm(n, device=x.device)[:max_points]
-        return x.index_select(0, idx), y.index_select(0, idx)
-
-    def _kl_distribution_loss(self, predictions, targets):
-        """
-        Benchmark-inspired surrogate for KL_score01_avg:
-          - per-sequence, per-region soft histograms
-          - symmetric KL
-          - similarity = 1 / (1 + KL_sym)
-          - geometric mean across regions
-          - average with lower-tail q10 over sequences
-        """
-        B, T, V = predictions.shape
         device = predictions.device
         dtype = predictions.dtype
-        eps = self.kl_eps
+        B, T, C = predictions.shape
+        if context_last is None:
+            context_last = targets[:, :1, :]
+        if context_last.ndim == 2:
+            context_last = context_last.unsqueeze(1)
 
-        pooled = torch.cat([targets.detach(), predictions.detach()], dim=1)  # (B, 2T, V)
-        pooled_flat = pooled.reshape(-1, V).float()
-        lo = torch.quantile(pooled_flat, self.kl_support_low, dim=0)
-        hi = torch.quantile(pooled_flat, self.kl_support_high, dim=0)
-        hi = torch.maximum(hi, lo + 1e-6)
+        abs_err = torch.abs(predictions - targets)
+        base_mae = abs_err.mean()
 
-        p = self._soft_histogram_probs(targets, lo.to(dtype), hi.to(dtype), self.kl_bins, eps)
-        q = self._soft_histogram_probs(predictions, lo.to(dtype), hi.to(dtype), self.kl_bins, eps)
+        # Peak/high activity weighted MAE
+        target_for_weight = torch.clamp(targets, min=0.0)
+        rel_level = torch.clamp(target_for_weight / self.loss_spike_weight_scale, min=0.0, max=self.loss_spike_weight_clip)
+        weight = 1.0 + self.loss_spike_weight_beta * rel_level
+        weighted_mae = (weight * abs_err).mean()
+        weighted_mae_term = weighted_mae - base_mae
 
-        kl_pq = (p * (torch.log(p + eps) - torch.log(q + eps))).sum(dim=-1)  # (B, V)
-        kl_qp = (q * (torch.log(q + eps) - torch.log(p + eps))).sum(dim=-1)  # (B, V)
-        kl_sym = 0.5 * (kl_pq + kl_qp)
+        # Derivatives with context-aware first step
+        dy_target = torch.zeros_like(targets)
+        dy_pred = torch.zeros_like(predictions)
+        dy_target[:, 0:1, :] = targets[:, 0:1, :] - context_last
+        dy_pred[:, 0:1, :] = predictions[:, 0:1, :] - context_last
+        if T > 1:
+            dy_target[:, 1:, :] = targets[:, 1:, :] - targets[:, :-1, :]
+            dy_pred[:, 1:, :] = predictions[:, 1:, :] - predictions[:, :-1, :]
 
-        sim = 1.0 / (1.0 + kl_sym)
-        sim = sim.clamp(min=eps, max=1.0)
+        onset_mask = (dy_target > self.loss_onset_threshold) & (targets > self.loss_onset_min_target)
+        onset_derivative_loss = self._masked_mae(dy_pred, dy_target, onset_mask)
+        onset_value_loss = self._masked_mae(predictions, targets, onset_mask)
 
-        kl_geo_seq = torch.exp(torch.mean(torch.log(sim), dim=1))  # (B,)
-
-        kl_mean = kl_geo_seq.mean()
-        if self.kl_use_q10:
-            kl_q10 = torch.quantile(kl_geo_seq.float(), 0.10).to(dtype)
-            kl_score01_avg = self.kl_q10_weight * kl_mean + (1.0 - self.kl_q10_weight) * kl_q10
+        high_target_mask = targets > self.loss_high_target_threshold
+        important_mask = onset_mask | high_target_mask
+        under_error = torch.relu(targets - predictions)
+        if float(important_mask.float().sum().item()) > 0:
+            underprediction_loss = (under_error * important_mask.float()).sum() / important_mask.float().sum().clamp_min(self.eps)
         else:
-            kl_q10 = torch.zeros((), device=device, dtype=dtype)
-            kl_score01_avg = kl_mean
+            underprediction_loss = torch.zeros((), device=device, dtype=dtype)
 
-        kl_loss = 1.0 - kl_score01_avg
-        return kl_loss, kl_mean, kl_q10, kl_score01_avg
+        # Weak false-positive penalty by default (for conservative behavior control)
+        inactive_mask = targets <= self.loss_false_positive_threshold
+        false_positive_raw = (torch.relu(predictions - self.loss_false_positive_threshold) * inactive_mask.float()).mean()
 
-    def _qnt_distribution_loss(self, predictions, targets):
-        """
-        Benchmark-inspired surrogate for QNT_score01:
-          Q_gt(b,v,q) = quantile_q of targets[b,:,v]
-          Q_pr(b,v,q) = quantile_q of preds[b,:,v]
-          d_tail(b,v) = mean over tail quantiles of |Q_gt - Q_pr| / (IQR_GT(v) + eps)
-          D_b         = mean of top-q worst regions for sequence b
-          D           = mean_b D_b
-          QNT_score01 = 1 / (1 + D)
-
-        Loss = 1 - QNT_score01
-        """
-        B, T, V = predictions.shape
-        device = predictions.device
-        dtype = predictions.dtype
-        eps = self.qnt_eps
-
-        targets_f = targets.float()
-        predictions_f = predictions.float()
-
-        quantiles = torch.linspace(
-            self.qnt_q_lo,
-            self.qnt_q_hi,
-            self.qnt_n_q,
-            device=device,
-            dtype=targets_f.dtype,
+        total = (
+            base_mae
+            + weighted_mae_term
+            + self.loss_onset_weight * onset_derivative_loss
+            + self.loss_onset_value_weight * onset_value_loss
+            + self.loss_underprediction_weight * underprediction_loss
+            + self.loss_false_positive_weight * false_positive_raw
         )
 
-        tail_mask = (quantiles <= self.qnt_tail_lo) | (quantiles >= self.qnt_tail_hi)
-        tail_idx = torch.where(tail_mask)[0]
-        if tail_idx.numel() == 0:
-            raise ValueError("QNT tail mask is empty. Check qnt_tail_lo/qnt_tail_hi settings.")
+        pred_min = predictions.min()
+        pred_max = predictions.max()
+        pred_mean = predictions.mean()
+        tgt_min = targets.min()
+        tgt_max = targets.max()
+        tgt_mean = targets.mean()
+        onset_frac = onset_mask.float().mean()
+        high_target_frac = high_target_mask.float().mean()
+        pred_negative_frac = (predictions < 0).float().mean()
 
-        targ_flat = targets_f.reshape(-1, V)
-        q25 = torch.quantile(targ_flat, 0.25, dim=0)
-        q75 = torch.quantile(targ_flat, 0.75, dim=0)
-        iqr_gt = (q75 - q25).clamp_min(eps)
-
-        q_gt = torch.quantile(targets_f, quantiles, dim=1)      # (Q, B, V)
-        q_pr = torch.quantile(predictions_f, quantiles, dim=1)  # (Q, B, V)
-
-        q_gt = q_gt.permute(1, 2, 0)  # (B, V, Q)
-        q_pr = q_pr.permute(1, 2, 0)  # (B, V, Q)
-
-        dq = torch.abs(q_gt - q_pr) / iqr_gt.view(1, V, 1)
-        d_tail = dq[:, :, tail_idx].mean(dim=-1)  # (B, V)
-
-        k = max(1, int(math.ceil(self.qnt_top_q_regions * V)))
-        topk_vals, _ = torch.topk(d_tail, k=k, dim=1, largest=True, sorted=False)
-        D_seq = topk_vals.mean(dim=1)  # (B,)
-
-        D = D_seq.mean()
-        qnt_score01 = 1.0 / (1.0 + D)
-        qnt_loss = 1.0 - qnt_score01
-
-        return qnt_loss, D, qnt_score01, D_seq, d_tail
-
-    def forward(self, predictions, targets):
-        B, T, V = predictions.shape
-        device = predictions.device
-        dtype = predictions.dtype
-        eps = 1e-6
-
-        err = (predictions - targets).abs()
-        if self.spike_weight_beta > 0.0:
-            # C_dec / deconvolved traces are positive-event dominated after z-scoring:
-            # emphasize positive target excursions, not large negative baselines.
-            w = 1.0 + self.spike_weight_beta * torch.relu(
-                targets - self.spike_z_threshold
-            )
-            spike_mae_raw = (err * w).sum() / w.sum().clamp_min(1e-8)
-        else:
-            spike_mae_raw = err.mean()
-
-        false_positive_raw = torch.zeros((), device=device, dtype=dtype)
-        if self.false_positive_weight > 0.0:
-            inactive = torch.sigmoid((self.false_positive_z_threshold - targets) * 4.0)
-            false_positive_raw = (torch.relu(predictions - self.false_positive_z_threshold) * inactive).mean()
-
-        mae_raw = spike_mae_raw + self.false_positive_weight * false_positive_raw
-
-        shape_raw = torch.zeros((), device=device, dtype=dtype)
-        deriv_raw = torch.zeros((), device=device, dtype=dtype)
-        cross_raw = torch.zeros((), device=device, dtype=dtype)
-        var_raw   = torch.zeros((), device=device, dtype=dtype)
-        kl_raw    = torch.zeros((), device=device, dtype=dtype)
-        qnt_raw   = torch.zeros((), device=device, dtype=dtype)
-
-        kl_mean_raw = torch.zeros((), device=device, dtype=dtype)
-        kl_q10_raw = torch.zeros((), device=device, dtype=dtype)
-        kl_score01_avg_raw = torch.zeros((), device=device, dtype=dtype)
-
-        qnt_D_raw = torch.zeros((), device=device, dtype=dtype)
-        qnt_score01_raw = torch.zeros((), device=device, dtype=dtype)
-
-        need_shape = (self.weights['shape'] != 0) or self.log_all_terms
-        need_deriv = (self.weights['deriv'] != 0) or self.log_all_terms
-        need_cross = (self.weights['cross'] != 0) or self.log_all_terms
-        need_var   = (self.weights['var']   != 0) or self.log_all_terms
-        need_kl    = (self.weights['kl']    != 0) or self.log_all_terms
-        need_qnt   = (self.weights['qnt']   != 0) or self.log_all_terms
-
-        if need_shape:
-            pred_norm = predictions - predictions.mean(dim=1, keepdim=True)
-            targ_norm = targets - targets.mean(dim=1, keepdim=True)
-            corr = (pred_norm * targ_norm).sum(dim=1) / (
-                torch.sqrt((pred_norm**2).sum(dim=1) + 1e-8) *
-                torch.sqrt((targ_norm**2).sum(dim=1) + 1e-8)
-            )
-            shape_raw = 1 - corr.mean()
-
-        if need_deriv:
-            if T > 1:
-                d_pred = predictions[:, 1:, :] - predictions[:, :-1, :]
-                d_targ = targets[:, 1:, :] - targets[:, :-1, :]
-                deriv_raw = torch.mean(torch.abs(d_pred - d_targ))
-
-        if need_cross:
-            pred_cov = torch.bmm(predictions.transpose(1, 2), predictions)
-            targ_cov = torch.bmm(targets.transpose(1, 2), targets)
-            cross_raw = self.mae(pred_cov, targ_cov)
-
-        if need_var:
-            pred_ctr = predictions - predictions.mean(dim=1, keepdim=True)
-            targ_ctr = targets     - targets.mean(dim=1, keepdim=True)
-
-            bins = [0, T//3, 2*T//3, T]
-            var_terms = []
-            for a, b in zip(bins[:-1], bins[1:]):
-                if b <= a:
-                    continue
-                ps = pred_ctr[:, a:b, :].std(dim=1, unbiased=False)
-                ts = targ_ctr[:, a:b, :].std(dim=1, unbiased=False)
-
-                log_ratio = torch.log(ps + eps) - torch.log(ts + eps)
-                under = F.relu(-log_ratio)
-                over  = F.relu(log_ratio)
-                var_terms.append(under.mean() + 0.25 * over.mean())
-
-            if var_terms:
-                var_raw = torch.stack(var_terms).mean()
-
-        if need_kl:
-            kl_raw, kl_mean_raw, kl_q10_raw, kl_score01_avg_raw = self._kl_distribution_loss(predictions, targets)
-
-        if need_qnt:
-            qnt_raw, qnt_D_raw, qnt_score01_raw, _, _ = self._qnt_distribution_loss(predictions, targets)
-
-        if not self.initialized and self.training:
-            self.running_norms[0] = mae_raw.detach() + 1e-8
-            self.running_norms[1] = (shape_raw.detach() + 1e-8) if need_shape else torch.tensor(1.0, device=device)
-            self.running_norms[2] = (deriv_raw.detach() + 1e-8) if need_deriv else torch.tensor(1.0, device=device)
-            self.running_norms[3] = (cross_raw.detach() + 1e-8) if need_cross else torch.tensor(1.0, device=device)
-            self.running_norms[4] = (var_raw.detach()   + 1e-8) if need_var   else torch.tensor(1.0, device=device)
-            self.running_norms[5] = (kl_raw.detach()    + 1e-8) if need_kl    else torch.tensor(1.0, device=device)
-            self.running_norms[6] = (qnt_raw.detach()   + 1e-8) if need_qnt   else torch.tensor(1.0, device=device)
-            self.initialized = True
-
-        total = self.weights['mae'] * (mae_raw / self.running_norms[0])
-        if self.weights['shape'] != 0:
-            total = total + self.weights['shape'] * (shape_raw / self.running_norms[1])
-        if self.weights['deriv'] != 0:
-            total = total + self.weights['deriv'] * (deriv_raw / self.running_norms[2])
-        if self.weights['cross'] != 0:
-            total = total + self.weights['cross'] * (cross_raw / self.running_norms[3])
-        if self.weights['var'] != 0:
-            total = total + self.weights['var'] * (var_raw / self.running_norms[4])
-        if self.weights['kl'] != 0:
-            total = total + self.weights['kl'] * (kl_raw / self.running_norms[5])
-        if self.weights['qnt'] != 0:
-            total = total + self.weights['qnt'] * (qnt_raw / self.running_norms[6])
-
+        # No normalized terms now; keep interface for existing training loop.
         loss_dict_norm = {
-            'mae':   (mae_raw   / self.running_norms[0]),
-            'shape': (shape_raw / self.running_norms[1]) if need_shape else torch.zeros((), device=device),
-            'deriv': (deriv_raw / self.running_norms[2]) if need_deriv else torch.zeros((), device=device),
-            'cross': (cross_raw / self.running_norms[3]) if need_cross else torch.zeros((), device=device),
-            'var':   (var_raw   / self.running_norms[4]) if need_var   else torch.zeros((), device=device),
-            'kl':    (kl_raw    / self.running_norms[5]) if need_kl    else torch.zeros((), device=device),
-            'qnt':   (qnt_raw   / self.running_norms[6]) if need_qnt   else torch.zeros((), device=device),
-            'total': total
+            "base_mae": base_mae,
+            "weighted_mae": weighted_mae,
+            "weighted_mae_term": weighted_mae_term,
+            "onset_derivative_loss": onset_derivative_loss,
+            "onset_value_loss": onset_value_loss,
+            "underprediction_loss": underprediction_loss,
+            "false_positive_loss": false_positive_raw,
+            "onset_fraction": onset_frac,
+            "high_target_fraction": high_target_frac,
+            "pred_min": pred_min,
+            "pred_max": pred_max,
+            "pred_mean": pred_mean,
+            "target_min": tgt_min,
+            "target_max": tgt_max,
+            "target_mean": tgt_mean,
+            "pred_negative_fraction": pred_negative_frac,
+            "total": total,
         }
-
-        loss_dict_raw = {
-            'mae': mae_raw,
-            'shape': shape_raw if need_shape else torch.zeros((), device=device),
-            'deriv': deriv_raw if need_deriv else torch.zeros((), device=device),
-            'cross': cross_raw if need_cross else torch.zeros((), device=device),
-            'var': var_raw if need_var else torch.zeros((), device=device),
-
-            'kl': kl_raw if need_kl else torch.zeros((), device=device),
-            'kl_mean': kl_mean_raw if need_kl else torch.zeros((), device=device),
-            'kl_q10': kl_q10_raw if need_kl else torch.zeros((), device=device),
-            'kl_score01_avg': kl_score01_avg_raw if need_kl else torch.zeros((), device=device),
-
-            'qnt': qnt_raw if need_qnt else torch.zeros((), device=device),
-            'qnt_D': qnt_D_raw if need_qnt else torch.zeros((), device=device),
-            'qnt_score01': qnt_score01_raw if need_qnt else torch.zeros((), device=device),
-
-            'total': total,
-        }
-
+        loss_dict_raw = dict(loss_dict_norm)
         return total, loss_dict_norm, loss_dict_raw
 
 
 def build_loss(config):
-    if config['loss_type'] == 'combined':
+    if config["loss_type"] == "combined":
         return CombinedLoss(
-            mae_weight=config.get('loss_mae_weight', 1.0),
-            shape_weight=config.get('loss_shape_weight', 0.0),
-            deriv_weight=config.get('loss_deriv_weight', 0.0),
-            cross_weight=config.get('loss_cross_weight', 0.0),
-            var_weight=config.get('loss_var_weight', 0.0),
-
-            kl_weight=config.get('loss_kl_weight', 0.0),
-            qnt_weight=config.get('loss_qnt_weight', 0.0),
-
-            log_all_terms=config.get('log_all_loss_terms', True),
-
-            kl_bins=config.get('loss_kl_bins', 33),
-            kl_eps=config.get('loss_kl_eps', 1e-8),
-            kl_support_low=config.get('loss_kl_support_low', 0.001),
-            kl_support_high=config.get('loss_kl_support_high', 0.999),
-            kl_use_q10=config.get('loss_kl_use_q10', True),
-            kl_q10_weight=config.get('loss_kl_q10_weight', 0.5),
-
-            qnt_q_lo=config.get('loss_qnt_q_lo', 0.01),
-            qnt_q_hi=config.get('loss_qnt_q_hi', 0.99),
-            qnt_n_q=config.get('loss_qnt_n_q', 99),
-            qnt_tail_lo=config.get('loss_qnt_tail_lo', 0.10),
-            qnt_tail_hi=config.get('loss_qnt_tail_hi', 0.90),
-            qnt_top_q_regions=config.get('loss_qnt_top_q_regions', 0.25),
-            qnt_eps=config.get('loss_qnt_eps', 1e-8),
-
-            spike_weight_beta=config.get('loss_spike_weight_beta', 0.0),
-            spike_z_threshold=config.get('loss_spike_z_threshold', 2.0),
-            false_positive_weight=config.get('loss_false_positive_weight', 0.0),
-            false_positive_z_threshold=config.get('loss_false_positive_z_threshold', 0.5),
+            loss_spike_weight_beta=config.get("loss_spike_weight_beta", 4.0),
+            loss_spike_weight_scale=config.get("loss_spike_weight_scale", 1.0),
+            loss_spike_weight_clip=config.get("loss_spike_weight_clip", 10.0),
+            loss_onset_weight=config.get("loss_onset_weight", 3.0),
+            loss_onset_threshold=config.get("loss_onset_threshold", 0.1),
+            loss_onset_min_target=config.get("loss_onset_min_target", 0.0),
+            loss_onset_value_weight=config.get("loss_onset_value_weight", 1.0),
+            loss_underprediction_weight=config.get("loss_underprediction_weight", 1.0),
+            loss_high_target_threshold=config.get("loss_high_target_threshold", 0.5),
+            loss_false_positive_weight=config.get("loss_false_positive_weight", 0.1),
+            loss_false_positive_threshold=config.get("loss_false_positive_z_threshold", 0.5),
+            eps=config.get("loss_eps", 1e-8),
         )
     
 def plot_learning_curves(train_history, val_history, save_dir):
@@ -926,12 +622,17 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ac
         if scaler is not None:
             with torch.amp.autocast(device_type="cuda"):
                 predictions = run_model_forward(model, input_batch, target_batch, current_p, forward_mode)
-                loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch)
+                context_last = input_batch[:, -1, :]
+                loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch, context_last=context_last)
                 loss = loss / accumulation_steps
         else:
             predictions = run_model_forward(model, input_batch, target_batch, current_p, forward_mode)
-            loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch)
+            context_last = input_batch[:, -1, :]
+            loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch, context_last=context_last)
             loss = loss / accumulation_steps
+
+        if torch.isnan(loss).any():
+            raise RuntimeError("NaN detected in training loss")
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -1032,10 +733,15 @@ def validate(model, val_loader, criterion, device, compute_per_region=False, n_v
             if use_amp and torch.cuda.is_available():
                 with torch.amp.autocast(device_type="cuda"):
                     predictions = run_model_forward(model, input_batch, target_batch, current_p, forward_mode)
-                    loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch)
+                    context_last = input_batch[:, -1, :]
+                    loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch, context_last=context_last)
             else:
                 predictions = run_model_forward(model, input_batch, target_batch, current_p, forward_mode)
-                loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch)
+                context_last = input_batch[:, -1, :]
+                loss, loss_dict_norm, loss_dict_raw = criterion(predictions, target_batch, context_last=context_last)
+
+            if torch.isnan(loss).any():
+                raise RuntimeError("NaN detected in validation loss")
 
             total_loss += float(loss.item())
 
@@ -1079,7 +785,9 @@ def train_single_mode(base_config, train_loader, val_loader, device, mode_tag, m
         dropout=config['dropout'],
         T_in=config['T_in'],
         T_out=config['T_out'],
-        device=device
+        device=device,
+        nonnegative_output=config.get("nonnegative_output", True),
+        output_activation=config.get("output_activation", "softplus"),
     )
 
     criterion = build_loss(config)
@@ -1124,7 +832,6 @@ def train_single_mode(base_config, train_loader, val_loader, device, mode_tag, m
 
     for epoch in range(1, config['num_epochs'] + 1):
         current_p = 0.5
-        criterion.weights['mae'] = 1.0
 
         print(f"[{mode_tag}] Epoch={epoch}/{config['num_epochs']}")
         train_loss, train_comp, train_comp_raw = train_epoch(
@@ -1216,24 +923,34 @@ def train_single_mode(base_config, train_loader, val_loader, device, mode_tag, m
             val_metrics["tl_total"] = float(val_tl_loss)
         if val_tl_comp is not None:
             print(
-                f"  Val(TL rollout): Total {val_tl_loss:.4f} | MAE {val_tl_comp['mae']:.4f} | Shape {val_tl_comp['shape']:.4f} "
-                f"| Deriv {val_tl_comp['deriv']:.4f} | Cross {val_tl_comp['cross']:.4f} | Var {val_tl_comp['var']:.4f}"
+                f"  Val(TL rollout): Total {val_tl_loss:.4f} | "
+                f"base_mae {val_tl_comp.get('base_mae', float('nan')):.4f} | "
+                f"onset_frac {val_tl_comp.get('onset_fraction', float('nan')):.4f}"
             )
 
 
         # Console prints
         print(
-            f"  Train: Total {train_loss:.4f} | MAE {train_comp['mae']:.4f} | Shape {train_comp['shape']:.4f} "
-            f"| Deriv {train_comp['deriv']:.4f} | Cross {train_comp['cross']:.4f} | Var {train_comp['var']:.4f}"
+            f"  Train: Total {train_loss:.4f} | "
+            f"base_mae {train_comp.get('base_mae', float('nan')):.4f} | "
+            f"weighted_mae {train_comp.get('weighted_mae', float('nan')):.4f} | "
+            f"onset_d {train_comp.get('onset_derivative_loss', float('nan')):.4f} | "
+            f"onset_v {train_comp.get('onset_value_loss', float('nan')):.4f} | "
+            f"under {train_comp.get('underprediction_loss', float('nan')):.4f}"
         )
         print(
-            f"  Val({mode_tag}): Total {val_loss:.4f} | MAE {val_comp['mae']:.4f} | Shape {val_comp['shape']:.4f} "
-            f"| Deriv {val_comp['deriv']:.4f} | Cross {val_comp['cross']:.4f} | Var {val_comp['var']:.4f}"
+            f"  Val({mode_tag}): Total {val_loss:.4f} | "
+            f"base_mae {val_comp.get('base_mae', float('nan')):.4f} | "
+            f"weighted_mae {val_comp.get('weighted_mae', float('nan')):.4f} | "
+            f"onset_d {val_comp.get('onset_derivative_loss', float('nan')):.4f} | "
+            f"onset_v {val_comp.get('onset_value_loss', float('nan')):.4f} | "
+            f"under {val_comp.get('underprediction_loss', float('nan')):.4f}"
         )
         if val_ar_comp is not None:
             print(
-                f"  Val(AR rollout): Total {val_ar_loss:.4f} | MAE {val_ar_comp['mae']:.4f} | Shape {val_ar_comp['shape']:.4f} "
-                f"| Deriv {val_ar_comp['deriv']:.4f} | Cross {val_ar_comp['cross']:.4f} | Var {val_ar_comp['var']:.4f}"
+                f"  Val(AR rollout): Total {val_ar_loss:.4f} | "
+                f"base_mae {val_ar_comp.get('base_mae', float('nan')):.4f} | "
+                f"onset_frac {val_ar_comp.get('onset_fraction', float('nan')):.4f}"
             )
 
         # -------------------------
@@ -1430,9 +1147,84 @@ def split_examples_temporal_stratified_train_val_test(
     )
 
 
+def split_examples_blocked_with_gap(
+    examples,
+    sequence_indices,
+    train_ratio=0.8,
+    val_ratio=0.1,
+    test_ratio=0.1,
+    gap_examples=0,
+):
+    """
+    Contiguous blocked split to avoid overlap leakage between train/val/test.
+    """
+    total_ratio = train_ratio + val_ratio + test_ratio
+    if not np.isclose(total_ratio, 1.0):
+        raise ValueError(
+            f"train/val/test ratios must sum to 1.0, got "
+            f"{train_ratio} + {val_ratio} + {test_ratio} = {total_ratio}"
+        )
+    n = len(examples)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+    g = int(max(0, gap_examples))
+
+    train_end = max(0, min(n, n_train))
+    val_start = max(train_end + g, 0)
+    val_end = max(val_start, min(n, val_start + n_val))
+    test_start = max(val_end + g, 0)
+
+    train_idx = np.arange(0, train_end, dtype=np.int64)
+    val_idx = np.arange(val_start, val_end, dtype=np.int64)
+    test_idx = np.arange(test_start, n, dtype=np.int64)
+
+    train_examples = examples[train_idx]
+    val_examples = examples[val_idx]
+    test_examples = examples[test_idx]
+    train_seq_indices = sequence_indices[train_idx]
+    val_seq_indices = sequence_indices[val_idx]
+    test_seq_indices = sequence_indices[test_idx]
+
+    print("\nBlocked split with gap:")
+    print(f"  Total examples: {n}")
+    print(f"  Gap examples between splits: {g}")
+    print(f"  Train: {len(train_examples)} ({100 * len(train_examples) / max(1, n):.1f}%)")
+    print(f"  Val:   {len(val_examples)} ({100 * len(val_examples) / max(1, n):.1f}%)")
+    print(f"  Test:  {len(test_examples)} ({100 * len(test_examples) / max(1, n):.1f}%)")
+
+    return (
+        train_examples,
+        val_examples,
+        test_examples,
+        train_seq_indices,
+        val_seq_indices,
+        test_seq_indices,
+    )
+
+
 
 def main():
     """Main training function."""
+    parser = argparse.ArgumentParser(description="Train 2p continuous spike-like trace model.")
+    parser.add_argument("--normalization_mode", type=str, default="none", choices=("none", "robust_zscore"))
+    parser.add_argument("--train_regime", type=str, default="AR_KV")
+    parser.add_argument("--split_mode", type=str, default="blocked", choices=("blocked", "random"))
+    parser.add_argument("--split_gap_timesteps", type=int, default=120)
+    parser.add_argument("--nonnegative_output", type=lambda x: str(x).lower() in ("1", "true", "yes"), default=True)
+    parser.add_argument("--output_activation", type=str, default="softplus", choices=("softplus", "relu", "clamp", "identity"))
+    parser.add_argument("--loss_onset_weight", type=float, default=3.0)
+    parser.add_argument("--loss_onset_value_weight", type=float, default=1.0)
+    parser.add_argument("--loss_onset_quantile", type=float, default=0.95)
+    parser.add_argument("--loss_onset_threshold", type=float, default=0.1)
+    parser.add_argument("--loss_onset_min_target", type=float, default=0.0)
+    parser.add_argument("--loss_spike_weight_beta", type=float, default=4.0)
+    parser.add_argument("--loss_spike_weight_scale_quantile", type=float, default=0.95)
+    parser.add_argument("--loss_spike_weight_clip", type=float, default=10.0)
+    parser.add_argument("--loss_underprediction_weight", type=float, default=1.0)
+    parser.add_argument("--loss_high_target_quantile", type=float, default=0.95)
+    parser.add_argument("--loss_false_positive_weight", type=float, default=0.1)
+    args = parser.parse_args()
+
     print("="*80)
     print("TRAINING SIMPLE DECODER-ONLY TRANSFORMER")
     print("="*80)
@@ -1451,7 +1243,7 @@ def main():
     config = {
         'data_path': 'data_processed/data2p_A_3_1189451_S10_C_dec_10Hz.npy', #'data_processed/data100_ba16.npy',
         'T_in': 90, #90,
-        'T_out': 90, #90,
+        'T_out': 1, # next-step for rollout realism
         'n_vars': 88,
         'd_model': 256,           # model_spec.d_model
         'n_heads': 8,            # model_spec.nhead
@@ -1469,14 +1261,30 @@ def main():
         'loss_deriv_weight': 0.0,  # Moderate weight to force smooth transitions
         'loss_cross_weight': 0.0,  # Low weight to maintain population structure
         'loss_var_weight': 0.0,
-        # Robust z-score + spike-weighted MAE (targets are normalized)
+        # Continuous spike-like trace objectives / scaling
+        'normalization_mode': args.normalization_mode,
         'norm_eps': 1e-5,
         'norm_std_floor_abs': 1e-4,
         'norm_std_floor_frac_median': 0.25,
-        'loss_spike_weight_beta': 2.0,
-        'loss_spike_z_threshold': 1.5,
-        'loss_false_positive_weight': 0.5,
+        'loss_spike_weight_beta': float(args.loss_spike_weight_beta),
+        'loss_spike_weight_scale_quantile': float(args.loss_spike_weight_scale_quantile),
+        'loss_spike_weight_clip': float(args.loss_spike_weight_clip),
+        'loss_spike_weight_scale': 1.0,
+        'loss_onset_weight': float(args.loss_onset_weight),
+        'loss_onset_value_weight': float(args.loss_onset_value_weight),
+        'loss_onset_quantile': float(args.loss_onset_quantile),
+        'loss_onset_threshold': float(args.loss_onset_threshold),
+        'loss_onset_min_target': float(args.loss_onset_min_target),
+        'loss_underprediction_weight': float(args.loss_underprediction_weight),
+        'loss_high_target_quantile': float(args.loss_high_target_quantile),
+        'loss_high_target_threshold': 1.0,
+        'loss_false_positive_weight': float(args.loss_false_positive_weight),
         'loss_false_positive_z_threshold': 1.0,
+        'train_regime': args.train_regime,
+        'split_mode': args.split_mode,
+        'split_gap_timesteps': int(args.split_gap_timesteps),
+        'nonnegative_output': bool(args.nonnegative_output),
+        'output_activation': str(args.output_activation),
         'learning_rate': 1e-4,    # training_spec.lr (will use scheduler instead)
         'max_lr': 0.0003,         # scheduler.max_lr
         'num_epochs': 150, #150 ,     # training_spec.epochs
@@ -1571,16 +1379,41 @@ def main():
         T_out=config['T_out']
     )
     
-    train_examples, val_examples, test_examples, train_seq_indices, val_seq_indices, test_seq_indices = (
-        split_examples_temporal_stratified_train_val_test(
-            examples,
-            sequence_indices,
-            train_ratio=config['train_ratio'],
-            val_ratio=config['val_ratio'],
-            test_ratio=config['test_ratio'],
-            random_seed=config['random_seed'],
+    # Convert split gap in timesteps to examples using prepare metadata window_stride when available.
+    gap_examples = int(config.get("split_gap_timesteps", 0))
+    metadata_path = Path(str(config["data_path"])).with_suffix("").with_name(Path(str(config["data_path"])).stem + "_metadata.json")
+    if metadata_path.exists():
+        try:
+            md = json.loads(metadata_path.read_text())
+            stride = int(md.get("partition", {}).get("window_stride", 1))
+            if stride > 0:
+                gap_examples = int(math.ceil(config.get("split_gap_timesteps", 0) / stride))
+                print(f"[split] using window_stride={stride} -> gap_examples={gap_examples}")
+        except Exception:
+            pass
+
+    if str(config.get("split_mode", "blocked")).lower() == "blocked":
+        train_examples, val_examples, test_examples, train_seq_indices, val_seq_indices, test_seq_indices = (
+            split_examples_blocked_with_gap(
+                examples,
+                sequence_indices,
+                train_ratio=config['train_ratio'],
+                val_ratio=config['val_ratio'],
+                test_ratio=config['test_ratio'],
+                gap_examples=gap_examples,
+            )
         )
-    )
+    else:
+        train_examples, val_examples, test_examples, train_seq_indices, val_seq_indices, test_seq_indices = (
+            split_examples_temporal_stratified_train_val_test(
+                examples,
+                sequence_indices,
+                train_ratio=config['train_ratio'],
+                val_ratio=config['val_ratio'],
+                test_ratio=config['test_ratio'],
+                random_seed=config['random_seed'],
+            )
+        )
 
 
     run_stem = (
@@ -1605,15 +1438,51 @@ def main():
         eps=float(config["norm_eps"]),
         floor_abs=float(config["norm_std_floor_abs"]),
         floor_frac_median=float(config["norm_std_floor_frac_median"]),
-        save_stats_path=str(stats_npy),
+        normalization_mode=str(config.get("normalization_mode", "robust_zscore")),
+        save_stats_path=None if str(config.get("normalization_mode", "robust_zscore")).lower() == "none" else str(stats_npy),
     )
 
-    np.save(val_npy, val_examples)  # normalized val
+    summarize_continuous_split("train_targets", train_examples[:, config["T_in"]:config["T_in"] + config["T_out"], :])
+    summarize_continuous_split("val_targets", val_examples[:, config["T_in"]:config["T_in"] + config["T_out"], :])
+    summarize_continuous_split("test_targets", test_examples[:, config["T_in"]:config["T_in"] + config["T_out"], :])
+
+    # Derive robust thresholds/scales from training targets for onset/peak weighting.
+    train_targets = train_examples[:, config["T_in"]:config["T_in"] + config["T_out"], :]
+    pos_vals = train_targets[train_targets > 0]
+    if pos_vals.size > 0:
+        config["loss_spike_weight_scale"] = float(np.quantile(pos_vals, config.get("loss_spike_weight_scale_quantile", 0.95)))
+        config["loss_high_target_threshold"] = float(np.quantile(pos_vals, config.get("loss_high_target_quantile", 0.95)))
+    else:
+        config["loss_spike_weight_scale"] = 1.0
+        config["loss_high_target_threshold"] = 1.0
+
+    # Onset threshold from positive derivatives if requested.
+    context_last_np = train_examples[:, config["T_in"] - 1:config["T_in"], :]
+    dy0 = train_targets[:, 0:1, :] - context_last_np
+    if train_targets.shape[1] > 1:
+        dyn = train_targets[:, 1:, :] - train_targets[:, :-1, :]
+        dy = np.concatenate([dy0, dyn], axis=1)
+    else:
+        dy = dy0
+    pos_dy = dy[dy > 0]
+    if pos_dy.size > 0 and config.get("loss_onset_quantile", None) is not None:
+        config["loss_onset_threshold"] = float(np.quantile(pos_dy, config.get("loss_onset_quantile", 0.95)))
+    print(
+        f"[loss scales] spike_scale={config['loss_spike_weight_scale']:.6g} "
+        f"onset_thr={config['loss_onset_threshold']:.6g} "
+        f"high_target_thr={config['loss_high_target_threshold']:.6g}"
+    )
+
+    np.save(val_npy, val_examples)  # processed val (raw if normalization_mode=none)
     np.save(val_seq_npy, val_seq_indices.astype(np.int64, copy=False))
-    np.save(test_npy, test_examples)  # normalized test
+    np.save(test_npy, test_examples)  # processed test (raw if normalization_mode=none)
     np.save(test_seq_npy, test_seq_indices.astype(np.int64, copy=False))
 
-    config["normalization_stats_base"] = str(stats_npy.with_suffix("").resolve())
+    config["normalization_stats_base"] = (
+        str(stats_npy.with_suffix("").resolve())
+        if str(config.get("normalization_mode", "robust_zscore")).lower() != "none"
+        else None
+    )
     config["processed_val_examples_path"] = str(val_npy.resolve())
     config["processed_val_seq_indices_path"] = str(val_seq_npy.resolve())
     config["processed_test_examples_path"] = str(test_npy.resolve())
@@ -1648,12 +1517,13 @@ def main():
     #verify_data_loading(train_loader, val_loader)
     
     # Train both modes sequentially
-    training_variants = [
-        #{'tag': 'AR_KV', 'label': 'KV Autoregressive'},
-        #{'tag': 'MIX_TF_AR_KV', 'label': 'Mixed Teacher Forcing and Autoregressive'},
-        #{'tag': 'AR', 'label': 'Autoregressive'},
-        {'tag': 'TF', 'label': 'Teacher Forcing'},
-    ]
+    train_regime = str(config.get("train_regime", "AR_KV")).upper()
+    if train_regime in ("MIX_TF_AR_KV", "MIXED"):
+        training_variants = [{"tag": "MIX_TF_AR_KV", "label": "Mixed Teacher Forcing + AR_KV"}]
+    elif train_regime == "TF":
+        training_variants = [{"tag": "TF", "label": "Teacher Forcing"}]
+    else:
+        training_variants = [{"tag": "AR_KV", "label": "KV Autoregressive"}]
 
     
     histories = []

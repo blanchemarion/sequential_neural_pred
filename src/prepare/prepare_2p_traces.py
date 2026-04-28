@@ -289,6 +289,8 @@ def prepare_single_csv(
     min_abs_max: float,
     trace_transform: str,
     clip_upper_quantile: float,
+    split_mode: str,
+    split_gap_timesteps: int,
     file_stem: str | None = None,
 ) -> dict[str, Path]:
     """End-to-end conversion from raw 2p csv to project npy/metadata format."""
@@ -347,6 +349,8 @@ def prepare_single_csv(
         "window_length": int(window_length),
         "window_stride": int(window_stride),
         "n_subsequences": int(data_array.shape[1]),
+        "split_mode": str(split_mode),
+        "split_gap_timesteps": int(split_gap_timesteps),
         "sampling_hz": 10.0,
         "sequence_partition": "100",
         "sequence_frac": 1.0,
@@ -430,9 +434,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--trace-transform",
-        choices=("auto", "identity", "sqrt", "log1p"),
-        default="auto",
-        help="Variance-stabilizing transform before export; auto uses sqrt for nonnegative traces.",
+        choices=("identity", "sqrt", "log1p", "auto"),
+        default="identity",
+        help="Trace transform before export. Use identity for raw continuous 2p runs.",
     )
     parser.add_argument(
         "--clip-upper-quantile",
@@ -451,6 +455,19 @@ def main() -> None:
         type=int,
         default=10,
         help="Stride between consecutive windows (default: 10, overlapping windows).",
+    )
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="blocked",
+        choices=("blocked", "random"),
+        help="Intended train split mode metadata (blocked recommended to avoid leakage).",
+    )
+    parser.add_argument(
+        "--split-gap-timesteps",
+        type=int,
+        default=120,
+        help="Gap between blocked train/val/test regions in timesteps.",
     )
     args = parser.parse_args()
 
@@ -498,6 +515,8 @@ def main() -> None:
             min_abs_max=args.min_abs_max,
             trace_transform=args.trace_transform,
             clip_upper_quantile=args.clip_upper_quantile,
+            split_mode=args.split_mode,
+            split_gap_timesteps=args.split_gap_timesteps,
             file_stem=file_stem,
         )
         all_exports.append(exports)

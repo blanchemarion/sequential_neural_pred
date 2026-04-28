@@ -80,8 +80,26 @@ python -c "import torch; print('torch', torch.__version__); print('torch cuda', 
 
 # ---- run steps (relative paths OK because we cd'ed into PROJECT_DIR) ----
 echo "[INFO] Running pipeline..."
-#time python src/prepare/prepare_2p_traces.py
-#time python src/train/train_all_regimes_2p.py
+time python src/prepare/prepare_2p_traces.py \
+  --trace-transform identity \
+  --split-mode blocked \
+  --split-gap-timesteps 120
+time python src/train/train_all_regimes_2p.py \
+  --normalization_mode none \
+  --train_regime AR_KV \
+  --split_mode blocked \
+  --split_gap_timesteps 120 \
+  --nonnegative_output true \
+  --output_activation softplus \
+  --loss_onset_weight 3.0 \
+  --loss_onset_value_weight 1.0 \
+  --loss_onset_quantile 0.95 \
+  --loss_spike_weight_beta 4.0 \
+  --loss_spike_weight_scale_quantile 0.95 \
+  --loss_spike_weight_clip 10.0 \
+  --loss_underprediction_weight 1.0 \
+  --loss_high_target_quantile 0.95 \
+  --loss_false_positive_weight 0.1
 time python src/infer/inference_all_regimes_2p.py
 
 echo "[INFO] Done at $(date)"

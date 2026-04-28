@@ -333,6 +333,8 @@ def create_inference_model(checkpoint_path, T_in, T_out, device='cpu'):
         T_out=T_out,
         #patch_len=original_config.get('patch_len', 1),
         device=device,
+        nonnegative_output=original_config.get("nonnegative_output", True),
+        output_activation=original_config.get("output_activation", "softplus"),
     )
     
     # Load weights with position embedding resizing
@@ -350,7 +352,7 @@ def generate_long_sequence(
     T_out,
     device="cpu",
     rollout_step_size=1,
-    clamp_z=(-5.0, 8.0),
+    clamp_z=None,
 ):
     model.eval()
     current_sequence = initial_input.to(device)
@@ -373,6 +375,7 @@ def generate_long_sequence(
             if clamp_z is not None:
                 lo, hi = clamp_z
                 pred = torch.clamp(pred, min=float(lo), max=float(hi))
+            pred = pred.clamp_min(0.0)
             # Append only the first predicted step by default. This avoids the visible
             # repeated T_out-block artifacts that sparse spike traces amplify.
             current_sequence = torch.cat([current_sequence, pred], dim=1)
@@ -495,7 +498,7 @@ def evaluate_long_window(
             T_out,
             device,
             rollout_step_size=1,
-            clamp_z=(-5.0, 8.0),
+            clamp_z=None,
         )
 
         all_predictions.append(long_pred.detach().cpu().numpy()[0])
@@ -506,6 +509,12 @@ def evaluate_long_window(
 
     print(f"\n  Predictions shape: {all_predictions.shape}")
     print(f"  Ground truth shape: {all_ground_truth.shape}")
+    print(
+        f"  Prediction stats: min={all_predictions.min():.6g}, max={all_predictions.max():.6g}, "
+        f"mean={all_predictions.mean():.6g}, negative_frac={(all_predictions < 0).mean():.6f}"
+    )
+    if np.any(all_predictions < 0):
+        print("  [WARNING] Negative values found in saved predictions.")
 
     # Align shapes if needed
     min_n = min(all_predictions.shape[0], all_ground_truth.shape[0])

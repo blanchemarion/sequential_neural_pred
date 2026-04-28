@@ -86,7 +86,7 @@ time python src/prepare/prepare_2p_traces.py \
   --split-gap-timesteps 120
 time python src/train/train_all_regimes_2p.py \
   --normalization_mode none \
-  --train_regime AR_KV \
+  --train_regime TF \
   --split_mode blocked \
   --split_gap_timesteps 120 \
   --nonnegative_output true \

@@ -1210,7 +1210,7 @@ def main():
     """Main training function."""
     parser = argparse.ArgumentParser(description="Train 2p continuous spike-like trace model.")
     parser.add_argument("--normalization_mode", type=str, default="none", choices=("none", "robust_zscore"))
-    parser.add_argument("--train_regime", type=str, default="AR_KV")
+    parser.add_argument("--train_regime", type=str, default="TF")
     parser.add_argument("--split_mode", type=str, default="blocked", choices=("blocked", "random"))
     parser.add_argument("--split_gap_timesteps", type=int, default=120)
     parser.add_argument("--nonnegative_output", type=lambda x: str(x).lower() in ("1", "true", "yes"), default=True)

@@ -1,8 +1,8 @@
 """
-Generate JSON run configs under configs/ for train_scaling_law.py.
+Generate JSON run configs under configs/ for ``train_sensitivity.py``.
 
-Choices for ``T_in``, seeds, and ``share_to_num_epochs`` come from ``scaling_law_globals.json``
-(override with ``--scaling-law-globals PATH``).
+Choices for ``T_in``, seeds, and ``share_to_num_epochs`` come from ``globals.json``
+(override with ``--globals PATH``).
 """
 
 from __future__ import annotations
@@ -17,12 +17,12 @@ _SRC = Path(__file__).resolve().parent.parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from helpers.scaling_law_globals import (
-    load_scaling_law_globals,
-    merge_generate_scaling_configs_section,
+from helpers.globals import (
+    load_globals,
+    merge_generate_configs_section,
     merge_paths_section,
     resolve_repo_relative,
-    scaling_law_repo_root,
+    repo_root,
 )
 
 STEM_RE = re.compile(r"^data(?P<share>\d+)_ba(?P<nvars>\d+)$")
@@ -82,13 +82,14 @@ def build_config_dict(
 
 
 def main() -> None:
-    repo = scaling_law_repo_root()
+    repo = repo_root()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--scaling-law-globals",
+        "--globals",
+        dest="globals_path",
         type=Path,
         default=None,
-        help="Path to scaling_law_globals.json (default: <repo>/scaling_law_globals.json)",
+        help="Path to globals.json (default: <repo>/globals.json)",
     )
     parser.add_argument(
         "--data-dir",
@@ -109,9 +110,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    full = load_scaling_law_globals(args.scaling_law_globals)
+    full = load_globals(args.globals_path)
     paths = merge_paths_section(full)
-    gsc = merge_generate_scaling_configs_section(full)
+    gsc = merge_generate_configs_section(full)
     t_in_choices = tuple(gsc["t_in_choices"])
     seeds = tuple(gsc["seeds"])
     share_to_num_epochs: dict[int, int] = gsc["share_to_num_epochs"]

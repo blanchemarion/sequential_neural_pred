@@ -1,11 +1,11 @@
 """
 This script loads parquet data, explores its structure, creates visualizations,
-and exports to npy format for model building.
+and exports to npy format for model building (sensitivity-analysis pipeline).
 
 Data Format: Wide format with sequenceId, itemPosition, and region columns
 
-Defaults and directory names are read from ``scaling_law_globals.json`` at the repo root
-(override with ``--scaling-law-globals PATH``).
+Defaults and directory names are read from ``globals.json`` at the repo root
+(override with ``--globals PATH``).
 """
 
 import argparse
@@ -24,17 +24,17 @@ _SRC = Path(__file__).resolve().parent.parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from helpers.scaling_law_globals import (
-    load_scaling_law_globals,
+from helpers.globals import (
+    load_globals,
     merge_prepare_data_section,
     merge_paths_section,
     resolve_repo_relative,
-    scaling_law_repo_root,
+    repo_root,
 )
 
 
 
-# All defaults now live in scaling_law_globals.json (loaded in main()).
+# All defaults now live in globals.json (loaded in main()).
 # Helper functions below accept these values as explicit arguments.
 
 
@@ -593,17 +593,18 @@ def main():
     """Load parquet once, then build and export one .npy per configured partition."""
     parser = argparse.ArgumentParser(description="Prepare parquet → data_processed .npy")
     parser.add_argument(
-        "--scaling-law-globals",
+        "--globals",
+        dest="globals_path",
         type=Path,
         default=None,
-        help="Path to scaling_law_globals.json (default: <repo>/scaling_law_globals.json)",
+        help="Path to globals.json (default: <repo>/globals.json)",
     )
     args = parser.parse_args()
 
-    full = load_scaling_law_globals(args.scaling_law_globals)
+    full = load_globals(args.globals_path)
     pcfg = merge_prepare_data_section(full)
     dir_paths = merge_paths_section(full)
-    repo = scaling_law_repo_root()
+    repo = repo_root()
 
     sequence_id_col       = str(pcfg["sequence_id_col"])
     id_cols               = tuple(str(x) for x in pcfg["id_cols"])

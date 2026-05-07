@@ -3,9 +3,9 @@ Prepare neural data for training.
 
 Loads wide-format parquet (sequenceId, itemPosition, brain regions), optionally
 explores/plots, and exports a 4D NumPy array compatible with
-``src/train/train_all_regimes.py`` (default: ``data_processed/data25_ba2.npy``).
+``src/train/train_all_regimes.py`` (default: ``data_processed/data100_ba16.npy``).
 
-Defaults and paths come from ``scaling_law_globals.json`` at the repo root.
+Defaults and paths come from ``globals.json`` at the repo root.
 """
 
 import argparse
@@ -23,7 +23,7 @@ _PREP_DIR = Path(__file__).resolve().parent
 if str(_PREP_DIR) not in sys.path:
     sys.path.insert(0, str(_PREP_DIR))
 
-from prepare_scaling import (
+from prepare_sensitivity import (
     brain_region_sample_rng,
     export_organized_data,
     list_brain_region_columns,
@@ -38,21 +38,21 @@ _SRC = Path(__file__).resolve().parent.parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from helpers.scaling_law_globals import (
-    load_scaling_law_globals,
+from helpers.globals import (
+    load_globals,
     merge_paths_section,
     merge_prepare_data_section,
     resolve_repo_relative,
-    scaling_law_repo_root,
+    repo_root,
 )
 
-# Must match train_all_regimes.py: T_in=90, T_out=90, n_vars=2, data_path data_processed/data25_ba2.npy
+# Must match train_all_regimes.py: T_in=90, T_out=90, n_vars=16, data_path data_processed/data100_ba16.npy
 TRAIN_T_IN = 90
 TRAIN_T_OUT = 90
 TRAIN_N_REGIONS = 16
 TRAIN_SEQ_FRAC = 1.0
 TRAIN_FILE_STEM = "data100_ba16"
-# npy_partitions order in scaling_law_globals: 100 -> 0, 50 -> 1, 25 -> 2
+# npy_partitions order in globals: 100 -> 0, 50 -> 1, 25 -> 2
 TRAIN_SEQ_PARTITION_INDEX = 0
 # Brain RNG stream index: 0=ba4, 1=ba8, 2=ba16 in prepare_data; use 3 for ba2-only export
 TRAIN_BRAIN_PARTITION_INDEX = 2
@@ -318,10 +318,11 @@ def main():
         description="Prepare parquet to NumPy for train_all_regimes.py (default: data25_ba2.npy)."
     )
     parser.add_argument(
-        "--scaling-law-globals",
+        "--globals",
+        dest="globals_path",
         type=Path,
         default=None,
-        help="Path to scaling_law_globals.json (default: repo root)",
+        help="Path to globals.json (default: repo root)",
     )
     parser.add_argument(
         "--analyze",
@@ -335,10 +336,10 @@ def main():
     )
     args = parser.parse_args()
 
-    full = load_scaling_law_globals(args.scaling_law_globals)
+    full = load_globals(args.globals_path)
     pcfg = merge_prepare_data_section(full)
     dir_paths = merge_paths_section(full)
-    repo = scaling_law_repo_root()
+    repo = repo_root()
 
     sequence_id_col = str(pcfg["sequence_id_col"])
     id_cols = tuple(str(x) for x in pcfg["id_cols"])
@@ -354,7 +355,7 @@ def main():
         raise ValueError(
             f"prepare_data.subsequence_length ({subsequence_length}) must be >= "
             f"T_in + T_out from train_all_regimes ({t_need}). "
-            f"Increase it in scaling_law_globals.json."
+            f"Increase it in globals.json."
         )
 
     input_dir = resolve_repo_relative(repo, dir_paths["data_raw"])

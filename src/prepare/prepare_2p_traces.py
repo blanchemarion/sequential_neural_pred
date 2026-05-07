@@ -26,18 +26,18 @@ _PREP_DIR = Path(__file__).resolve().parent
 if str(_PREP_DIR) not in sys.path:
     sys.path.insert(0, str(_PREP_DIR))
 
-from prepare_data import export_organized_data
+from prepare_sensitivity import export_organized_data
 
 _SRC = Path(__file__).resolve().parent.parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from helpers.scaling_law_globals import (
-    load_scaling_law_globals,
+from helpers.globals import (
+    load_globals,
     merge_paths_section,
     merge_prepare_data_section,
     resolve_repo_relative,
-    scaling_law_repo_root,
+    repo_root,
 )
 
 
@@ -390,10 +390,11 @@ def main() -> None:
         description="Prepare 2p-traces CSV (neurons x time) into project .npy format."
     )
     parser.add_argument(
-        "--scaling-law-globals",
+        "--globals",
+        dest="globals_path",
         type=Path,
         default=None,
-        help="Path to scaling_law_globals.json (default: repo root).",
+        help="Path to globals.json (default: repo root).",
     )
     parser.add_argument(
         "--csv",
@@ -471,10 +472,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    full = load_scaling_law_globals(args.scaling_law_globals)
+    full = load_globals(args.globals_path)
     pcfg = merge_prepare_data_section(full)
     dir_paths = merge_paths_section(full)
-    repo = scaling_law_repo_root()
+    repo = repo_root()
 
     output_data_dir = resolve_repo_relative(repo, dir_paths["data_processed"])
     output_plot_root = resolve_repo_relative(repo, "output")

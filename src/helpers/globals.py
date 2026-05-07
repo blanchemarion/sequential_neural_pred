@@ -1,7 +1,17 @@
 """
-Load ``scaling_law_globals.json`` at the repository root (single source for pipeline defaults).
+Load ``globals.json`` at the repository root (single source for pipeline defaults).
 
-Scripts accept ``--scaling-law-globals PATH`` to override the default file location.
+Scripts accept ``--globals PATH`` to override the default file location.
+
+Top-level sections expected in ``globals.json``::
+
+    {
+      "paths": {...},
+      "prepare_data": {...},
+      "train_sensitivity": { "base_config": {...} },
+      "generate_configs": {...},
+      "inference_sensitivity": {...}
+    }
 """
 
 from __future__ import annotations
@@ -12,17 +22,17 @@ from pathlib import Path
 from typing import Any
 
 
-def scaling_law_repo_root() -> Path:
+def repo_root() -> Path:
     """``sequential_neural_pred/`` (parent of ``src/``)."""
     return Path(__file__).resolve().parents[2]
 
 
-def default_scaling_law_globals_path() -> Path:
-    return scaling_law_repo_root() / "scaling_law_globals.json"
+def default_globals_path() -> Path:
+    return repo_root() / "globals.json"
 
 
-def load_scaling_law_globals(path: Path | None = None) -> dict[str, Any]:
-    p = Path(path) if path is not None else default_scaling_law_globals_path()
+def load_globals(path: Path | None = None) -> dict[str, Any]:
+    p = Path(path) if path is not None else default_globals_path()
     if not p.is_file():
         return {}
     with open(p, encoding="utf-8") as f:
@@ -30,9 +40,9 @@ def load_scaling_law_globals(path: Path | None = None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def resolve_repo_relative(repo_root: Path, rel: str | Path) -> Path:
+def resolve_repo_relative(root: Path, rel: str | Path) -> Path:
     p = Path(rel)
-    return p.resolve() if p.is_absolute() else (repo_root / p).resolve()
+    return p.resolve() if p.is_absolute() else (root / p).resolve()
 
 
 def merge_paths_section(full: dict[str, Any]) -> dict[str, str]:
@@ -60,13 +70,8 @@ def merge_prepare_data_section(full: dict[str, Any]) -> dict[str, Any]:
         "metadata_json_filename": "data-clean-all.json",
         "npy_partitions": [
             {"name": "100", "sequence_frac": 1.0},
-            #{"name": "50", "sequence_frac": 0.5},
-            #{"name": "25", "sequence_frac": 0.25},
         ],
         "brain_region_partitions": [
-            #{"name": "2", "brain_areas": 2},
-            #{"name": "4", "brain_areas": 4},
-            #{"name": "8", "brain_areas": 8},
             {"name": "16", "brain_areas": 16},
         ],
         "sequence_id_col": "sequenceId",
@@ -85,15 +90,15 @@ def merge_prepare_data_section(full: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def merge_generate_scaling_configs_section(full: dict[str, Any]) -> dict[str, Any]:
+def merge_generate_configs_section(full: dict[str, Any]) -> dict[str, Any]:
     defaults: dict[str, Any] = {
-        "t_in_choices": [300], #[30, 90, 300],
-        "seeds": [101], #[101, 102, 103, 104, 105],
-        "share_to_num_epochs": {"100": 100}, #{"25": 400, "50": 200, "100": 100},
+        "t_in_choices": [300],
+        "seeds": [101],
+        "share_to_num_epochs": {"100": 100},
     }
-    sec = full.get("generate_scaling_configs")
+    sec = full.get("generate_configs")
     if not isinstance(sec, dict):
-        return {**defaults}
+        sec = {}
     out = {**defaults, **sec}
     if "t_in_choices" in sec and isinstance(sec["t_in_choices"], list):
         out["t_in_choices"] = [int(x) for x in sec["t_in_choices"]]
@@ -102,24 +107,27 @@ def merge_generate_scaling_configs_section(full: dict[str, Any]) -> dict[str, An
     if "share_to_num_epochs" in sec and isinstance(sec["share_to_num_epochs"], dict):
         raw = sec["share_to_num_epochs"]
         out["share_to_num_epochs"] = {int(k): int(v) for k, v in raw.items()}
+    else:
+        out["share_to_num_epochs"] = {int(k): int(v) for k, v in defaults["share_to_num_epochs"].items()}
     return out
 
 
 def train_base_config_from_globals(full: dict[str, Any]) -> dict[str, Any] | None:
-    sec = full.get("train_scaling_law")
+    """Return a deep copy of ``train_sensitivity.base_config`` if present, else ``None``."""
+    sec = full.get("train_sensitivity")
     if not isinstance(sec, dict):
         return None
     base = sec.get("base_config")
     return copy.deepcopy(base) if isinstance(base, dict) and base else None
 
 
-def merge_inference_scaling_law_section(full: dict[str, Any]) -> dict[str, Any]:
+def merge_inference_section(full: dict[str, Any]) -> dict[str, Any]:
     defaults = {
         "num_sequences": 200,
         "long_pred_length": 810,
         "n_plot_examples": 0,
     }
-    sec = full.get("inference_scaling_law")
+    sec = full.get("inference_sensitivity")
     if not isinstance(sec, dict):
         return {**defaults}
     out = {**defaults, **sec}

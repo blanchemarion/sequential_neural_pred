@@ -1,10 +1,11 @@
 """
 Training script for Decoder-Only Transformer on multi-step time series prediction.
 
-Scaling-law mode: by default, all .json / .yaml / .yml files under the repo ``configs/`` directory
-are used as run configs (or pass explicit paths). Each run file must define T_in, data_path,
-random_seed, num_epochs, n_vars. Other hyperparameters come from the shared base config unless
-overridden in the same file.
+Sensitivity-analysis mode: by default, all .json / .yaml / .yml files under the
+repo ``configs/`` directory are used as run configs (or pass explicit paths).
+Each run file must define ``T_in``, ``data_path``, ``random_seed``, ``num_epochs``,
+``n_vars``. Other hyperparameters come from the shared base config (loaded from
+``globals.json -> train_sensitivity.base_config``) unless overridden in the same file.
 """
 
 from __future__ import annotations
@@ -38,20 +39,20 @@ from helpers.preprocess_helpers import (
     normalize_after_split_input_only,
     verify_data_loading,
 )
-from helpers.scaling_law_globals import (
-    load_scaling_law_globals,
+from helpers.globals import (
+    load_globals,
     merge_paths_section,
     train_base_config_from_globals,
 )
 from models.model_KV_cached import create_model_cached
 #from models.models import create_model
 
-_SCALING_LAW_GLOBALS_PATH: Path | None = None
+_GLOBALS_PATH: Path | None = None
 
 
-def set_scaling_law_globals_path(path: Path | None) -> None:
-    global _SCALING_LAW_GLOBALS_PATH
-    _SCALING_LAW_GLOBALS_PATH = Path(path) if path is not None else None
+def set_globals_path(path: Path | None) -> None:
+    global _GLOBALS_PATH
+    _GLOBALS_PATH = Path(path) if path is not None else None
 
 
 # =========================
@@ -495,15 +496,15 @@ def build_loss(config):
         )
 
 
-# --- Scaling-law: per-run config files (YAML / JSON) ---------------------------------
+# ---  per-run config files (YAML / JSON) ---------------------------------
 
-REQUIRED_SCALING_RUN_KEYS = frozenset(
+REQUIRED_RUN_KEYS = frozenset(
     {"T_in", "data_path", "random_seed", "num_epochs", "n_vars"}
 )
 
 
 def _fallback_training_base_config() -> dict:
-    """Used only if ``scaling_law_globals.json`` has no ``train_scaling_law.base_config``."""
+    """Used only if ``globals.json`` has no ``train_sensitivity.base_config``."""
     return {
         "data_path": "data_processed/data25_ba2.npy",
         "T_in": 30,
@@ -550,8 +551,8 @@ def _fallback_training_base_config() -> dict:
 
 
 def get_default_base_config() -> dict:
-    """Shared hyperparameters from ``scaling_law_globals.json`` with Python fallback."""
-    full = load_scaling_law_globals(_SCALING_LAW_GLOBALS_PATH)
+    """Shared hyperparameters from ``globals.json`` with Python fallback."""
+    full = load_globals(_GLOBALS_PATH)
     loaded = train_base_config_from_globals(full)
     return loaded if loaded is not None else _fallback_training_base_config()
 
@@ -574,16 +575,16 @@ def load_run_config_file(path: Path) -> dict:
     return data
 
 
-def validate_scaling_run_dict(overrides: dict, path: Path) -> None:
-    missing = REQUIRED_SCALING_RUN_KEYS - set(overrides.keys())
+def validate_run_dict(overrides: dict, path: Path) -> None:
+    missing = REQUIRED_RUN_KEYS - set(overrides.keys())
     if missing:
         raise ValueError(
             f"{path}: missing required keys {sorted(missing)}. "
-            f"Required: {sorted(REQUIRED_SCALING_RUN_KEYS)}"
+            f"Required: {sorted(REQUIRED_RUN_KEYS)}"
         )
 
 
-def merge_scaling_config(
+def merge_config(
     base: dict,
     overrides: dict,
     *,
@@ -597,7 +598,7 @@ def merge_scaling_config(
     return merged
 
 
-def scaling_law_project_root() -> Path:
+def sensitivity_project_root() -> Path:
     """Repository root (parent of ``src/``); this file lives under ``src/train/``."""
     return Path(__file__).resolve().parents[2]
 
@@ -610,7 +611,7 @@ def train_norm_stats_npy_path(config_json_path: Path) -> Path:
     stem = Path(config_json_path).stem
     if not stem:
         stem = "run"
-    return scaling_law_project_root() / "data_processed" / f"train_norm_stats_{stem}.npy"
+    return sensitivity_project_root() / "data_processed" / f"train_norm_stats_{stem}.npy"
 
 
 def processed_split_examples_paths(config_json_path: Path) -> tuple[Path, Path, Path, Path]:
@@ -622,7 +623,7 @@ def processed_split_examples_paths(config_json_path: Path) -> tuple[Path, Path, 
     stem = Path(config_json_path).stem
     if not stem:
         stem = "run"
-    root = scaling_law_project_root() / "data_processed"
+    root = sensitivity_project_root() / "data_processed"
     train_p = root / f"processed_train_{stem}.npy"
     val_p = root / f"processed_val_{stem}.npy"
     val_seq_p = root / f"processed_val_seq_indices_{stem}.npy"
@@ -675,10 +676,10 @@ def save_processed_split_for_inference(
     print(f"  Meta:  {meta_p}")
 
 
-def default_scaling_configs_dir() -> Path:
-    full = load_scaling_law_globals(_SCALING_LAW_GLOBALS_PATH)
+def default_configs_dir() -> Path:
+    full = load_globals(_GLOBALS_PATH)
     paths = merge_paths_section(full)
-    return scaling_law_project_root() / paths["configs"]
+    return sensitivity_project_root() / paths["configs"]
 
 
 def discover_run_configs_in_dir(dir_path: Path) -> list[Path]:
@@ -692,7 +693,7 @@ def discover_run_configs_in_dir(dir_path: Path) -> list[Path]:
     return sorted(found, key=lambda p: p.name.lower())
 
 
-def scaling_checkpoint_milestones(num_epochs: int) -> list[int]:
+def sensitivity_checkpoint_milestones(num_epochs: int) -> list[int]:
     """Epochs (1-based) at 0.1*n, 0.3*n, and n; deduplicated, in order."""
     n = int(num_epochs)
     if n < 1:
@@ -709,7 +710,7 @@ def scaling_checkpoint_milestones(num_epochs: int) -> list[int]:
     return out
 
 
-def build_scaling_checkpoint_filename(mode_tag: str, config: dict, epoch: int) -> str:
+def build_sensitivity_checkpoint_filename(mode_tag: str, config: dict, epoch: int) -> str:
     """
     e.g. checkpoints_AR_KV_data50_ba4_Tin30_seed101_epoch3.pt
     """
@@ -719,7 +720,7 @@ def build_scaling_checkpoint_filename(mode_tag: str, config: dict, epoch: int) -
     return f"checkpoints_{mode_tag}_{stem}_Tin{tin}_seed{seed}_epoch{epoch}.pt"
 
 
-def save_scaling_checkpoint_pt(
+def save_sensitivity_checkpoint_pt(
     model,
     optimizer,
     scheduler,
@@ -733,7 +734,7 @@ def save_scaling_checkpoint_pt(
 ) -> Path:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = build_scaling_checkpoint_filename(mode_tag, config, epoch)
+    name = build_sensitivity_checkpoint_filename(mode_tag, config, epoch)
     path = out_dir / name
     to_save = model._orig_mod if hasattr(model, "_orig_mod") else model
     torch.save(
@@ -930,7 +931,7 @@ def validate(model, val_loader, criterion, device, compute_per_region=False, n_v
 def train_single_mode(base_config, train_loader, val_loader, device, mode_tag, mode_label):
     config = dict(base_config)
     ckpt_dir = Path(config.get("checkpoint_flat_dir", "checkpoints"))
-    milestones = scaling_checkpoint_milestones(config["num_epochs"])
+    milestones = sensitivity_checkpoint_milestones(config["num_epochs"])
     saved_checkpoints: list[Path] = []
     print(f"[{mode_tag}] Milestone checkpoints (epochs): {milestones}")
 
@@ -1013,7 +1014,7 @@ def train_single_mode(base_config, train_loader, val_loader, device, mode_tag, m
         )
 
         if epoch in milestones:
-            path = save_scaling_checkpoint_pt(
+            path = save_sensitivity_checkpoint_pt(
                 model,
                 optimizer,
                 scheduler,
@@ -1092,7 +1093,7 @@ def _print_training_config_summary(config: dict) -> None:
     print(f"    save_every: {config['save_every']} epochs")
 
 
-def train_single_scaling_run(
+def train_single_run(
     path: Path,
     config: dict,
     device: torch.device | None = None,
@@ -1196,7 +1197,7 @@ def train_single_scaling_run(
     return histories
 
 
-def run_scaling_law_from_config_files(
+def run_from_config_files(
     config_paths: list[Path],
     *,
     base_config: dict | None = None,
@@ -1211,12 +1212,12 @@ def run_scaling_law_from_config_files(
     for path in config_paths:
         path = Path(path)
         overrides = load_run_config_file(path)
-        validate_scaling_run_dict(overrides, path)
-        merged = merge_scaling_config(base, overrides, run_label=path.stem)
+        validate_run_dict(overrides, path)
+        merged = merge_config(base, overrides, run_label=path.stem)
         print("\n" + "=" * 80)
-        print(f"SCALING RUN: {path}")
+        print(f"RUN: {path}")
         print("=" * 80)
-        histories = train_single_scaling_run(
+        histories = train_single_run(
             path, merged, training_variants=training_variants
         )
         results.append(
@@ -1240,16 +1241,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional explicit per-run config paths (overrides configs-dir scan)",
     )
     parser.add_argument(
-        "--scaling-law-globals",
+        "--globals",
         type=Path,
         default=None,
-        help="Path to scaling_law_globals.json (default: <repo>/scaling_law_globals.json)",
+        help="Path to globals.json (default: <repo>/globals.json)",
     )
     parser.add_argument(
         "--configs-dir",
         type=Path,
         default=None,
-        help="Directory to scan for run configs (default: from scaling_law_globals.json paths.configs)",
+        help="Directory to scan for run configs (default: from globals.json paths.configs)",
     )
     parser.add_argument(
         "--no-configs-dir",
@@ -1265,7 +1266,7 @@ def main(argv: list[str] | None = None) -> None:
     argv = argv if argv is not None else sys.argv[1:]
     args = parser.parse_args(argv)
 
-    set_scaling_law_globals_path(args.scaling_law_globals)
+    set_globals_path(args.globals)
 
     base = get_default_base_config()
     if args.base_config is not None:
@@ -1275,7 +1276,7 @@ def main(argv: list[str] | None = None) -> None:
     import gc
 
     print("=" * 80)
-    print("TRAINING SIMPLE DECODER-ONLY TRANSFORMER (scaling law)")
+    print("TRAINING SIMPLE DECODER-ONLY TRANSFORMER")
     print("=" * 80)
     gc.collect()
     if torch.cuda.is_available():
@@ -1285,13 +1286,13 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[INFO] GPU Memory reserved: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
 
     if args.no_configs_dir:
-        train_single_scaling_run(Path("base"), base)
+        train_single_run(Path("base"), base)
         return
 
     if args.configs:
         config_paths = [Path(p) for p in args.configs]
     else:
-        cfg_dir = args.configs_dir if args.configs_dir is not None else default_scaling_configs_dir()
+        cfg_dir = args.configs_dir if args.configs_dir is not None else default_configs_dir()
         config_paths = discover_run_configs_in_dir(cfg_dir)
         if not config_paths:
             print(
@@ -1303,7 +1304,7 @@ def main(argv: list[str] | None = None) -> None:
         for p in config_paths:
             print(f"  - {p}")
 
-    run_scaling_law_from_config_files(config_paths, base_config=base)
+    run_from_config_files(config_paths, base_config=base)
 
 
 if __name__ == "__main__":

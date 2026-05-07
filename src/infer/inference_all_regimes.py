@@ -46,7 +46,10 @@ from helpers.preprocess_helpers import (
 
 
 from models.model_KV_cached import create_model_cached
-from models.models import create_model
+try:
+    from models.models import create_model  # legacy non-cached transformer; optional
+except ImportError:  # pragma: no cover - models.models removed in current layout
+    create_model = None
 
 NUM_SEQUENCES = 222
 SHORT_PRED_LENGTH = 90  # Fixed prediction length for short window

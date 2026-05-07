@@ -1,5 +1,5 @@
 """
-Long-horizon inference for scaling-law checkpoints.
+Long-horizon inference for sensitivity-analysis checkpoints.
 
 For each ``checkpoints_*_data*_ba*_Tin*_seed*_epoch*.pt`` file, loads the matching
 ``processed_val_config_{same_middle}.npy`` (normalized val split from training),
@@ -21,7 +21,7 @@ import re
 import sys
 from pathlib import Path
 
-# Allow `python src/infer/inference_scaling_law.py` (no package context for relative imports).
+# Allow `python src/infer/inference_sensitivity.py` (no package context for relative imports).
 _SRC_ROOT = Path(__file__).resolve().parent.parent
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
@@ -34,27 +34,27 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from helpers.scaling_law_globals import (
-    load_scaling_law_globals,
-    merge_inference_scaling_law_section,
+from helpers.globals import (
+    load_globals,
+    merge_inference_section,
     merge_paths_section,
     resolve_repo_relative,
 )
 from models.model_KV_cached import create_model_cached
 #from models.models import create_model
 
-_inf_defaults = merge_inference_scaling_law_section(load_scaling_law_globals())
+_inf_defaults = merge_inference_section(load_globals())
 NUM_SEQUENCES = int(_inf_defaults["num_sequences"])
 LONG_PRED_LENGTH = int(_inf_defaults["long_pred_length"])
 N_FORECAST_EXAMPLE_PLOTS = int(_inf_defaults["n_plot_examples"])
 
 
-def scaling_law_project_root() -> Path:
+def sensitivity_project_root() -> Path:
     """Repository root (parent of ``src/``); scripts live under ``src/infer/`` or ``src/train/``."""
     return Path(__file__).resolve().parents[2]
 
 
-def parse_scaling_checkpoint_stem(stem: str) -> tuple[str, int] | None:
+def parse_sensitivity_checkpoint_stem(stem: str) -> tuple[str, int] | None:
     """
     From ``checkpoints_AR_KV_data25_ba2_Tin30_seed101_epoch1`` return
     (``data25_ba2_Tin30_seed101``, 1).
@@ -71,12 +71,12 @@ def parse_scaling_checkpoint_stem(stem: str) -> tuple[str, int] | None:
 
 
 def processed_val_npy_path(middle: str) -> Path:
-    return scaling_law_project_root() / "data_processed" / f"processed_val_config_{middle}.npy"
+    return sensitivity_project_root() / "data_processed" / f"processed_val_config_{middle}.npy"
 
 
 def processed_val_seq_indices_npy_path(middle: str) -> Path:
     return (
-        scaling_law_project_root()
+        sensitivity_project_root()
         / "data_processed"
         / f"processed_val_seq_indices_config_{middle}.npy"
     )
@@ -100,7 +100,7 @@ def resolve_val_seq_indices_path(middle: str, ckpt_config: dict | None) -> Path:
 
 
 def run_config_json_path(middle: str) -> Path:
-    return scaling_law_project_root() / "configs" / f"config_{middle}.json"
+    return sensitivity_project_root() / "configs" / f"config_{middle}.json"
 
 
 def load_run_config(middle: str) -> dict:
@@ -367,7 +367,7 @@ def run_one_checkpoint(
     predictions_dir: Path,
     n_plot_examples: int = N_FORECAST_EXAMPLE_PLOTS,
 ) -> Path | None:
-    parsed = parse_scaling_checkpoint_stem(ckpt_path.stem)
+    parsed = parse_sensitivity_checkpoint_stem(ckpt_path.stem)
     if parsed is None:
         print(f"[SKIP] Unrecognized checkpoint name: {ckpt_path.name}")
         return None
@@ -497,10 +497,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Folder containing checkpoints_*_epoch*.pt (default: <repo>/checkpoints)",
     )
     parser.add_argument(
-        "--scaling-law-globals",
+        "--globals",
+        dest="globals_path",
         type=Path,
         default=None,
-        help="Path to scaling_law_globals.json (default: <repo>/scaling_law_globals.json)",
+        help="Path to globals.json (default: <repo>/globals.json)",
     )
     parser.add_argument(
         "--predictions-dir",
@@ -514,7 +515,7 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help=(
             f"Unique val subsequences to evaluate (default: "
-            f"inference_scaling_law.num_sequences in globals, else {NUM_SEQUENCES})"
+            f"inference_sensitivity.num_sequences in globals, else {NUM_SEQUENCES})"
         ),
     )
     parser.add_argument(
@@ -532,10 +533,10 @@ def main(argv: list[str] | None = None) -> None:
     argv = argv if argv is not None else sys.argv[1:]
     args = parser.parse_args(argv)
 
-    root = scaling_law_project_root()
-    full = load_scaling_law_globals(args.scaling_law_globals)
+    root = sensitivity_project_root()
+    full = load_globals(args.globals_path)
     paths = merge_paths_section(full)
-    inf = merge_inference_scaling_law_section(full)
+    inf = merge_inference_section(full)
 
     ckpt_dir = (
         Path(args.checkpoints_dir).resolve()
@@ -557,7 +558,7 @@ def main(argv: list[str] | None = None) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 80)
-    print("SCALING-LAW INFERENCE (saved val + per-checkpoint .npy)")
+    print("SENSITIVITY-ANALYSIS INFERENCE (saved val + per-checkpoint .npy)")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Checkpoints dir: {ckpt_dir.resolve()}")

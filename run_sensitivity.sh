@@ -79,9 +79,9 @@ python -c "import torch; print(torch.cuda.is_available()); print(torch.version.c
 
 # ---- run steps (relative paths OK because we cd'ed into PROJECT_DIR) ----
 echo "[INFO] Running pipeline..."
-time python src/prepare/prepare_scaling.py
-time python src/prepare/generate_scaling_configs.py
-time python src/train/train_scaling_law.py
-time python src/infer/inference_scaling_law.py
+time python src/prepare/prepare_sensitivity.py
+time python src/prepare/generate_configs.py
+time python src/train/train_sensitivity.py
+time python src/infer/inference_sensitivity.py
 
 echo "[INFO] Done at $(date)"

@@ -28,7 +28,7 @@
     "only_full_subsequences": true,
     "id_cols": ["sequenceId", "itemPosition"]
   },
-  "train_scaling_law": {
+  "train_sensitivity": {
     "base_config": {
       "T_out": 1,
       "d_model": 64,
@@ -70,7 +70,7 @@
       "save_processed_split_examples": true
     }
   },
-  "generate_scaling_configs": {
+  "generate_configs": {
     "t_in_choices": [30, 90, 300],
     "seeds": [101],
     "share_to_num_epochs": {
@@ -79,7 +79,7 @@
       "100": 150
     }
   },
-  "inference_scaling_law": {
+  "inference_sensitivity": {
     "num_sequences": 200,
     "long_pred_length": 810,
     "n_plot_examples": 1

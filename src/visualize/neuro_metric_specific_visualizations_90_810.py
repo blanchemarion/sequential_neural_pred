@@ -2,10 +2,10 @@
 """
 Metric-faithful Nethobench diagnostic visualizations for the 90_810 arrays.
 
-This script complements ``neuro_submetric_visualizations_90_810.py``.  The
-family and horizon plots in that script are already official
-``compute_neuro_scores`` outputs; the figures here visualize the raw quantities
-that feed each selected official submetric.
+Tensor paths default to ``evaluation_results/90_810/seed_102``; figures and score
+CSVs go under ``output/neuro_metric_specific_visualizations_90_810/`` at the repo root.
+The family plots use official ``compute_neuro_scores`` outputs; the figures here
+visualize the raw quantities that feed each selected official submetric.
 
 When official helpers expose the intermediate, this file imports them.  For the
 notebook-only metrics (KL/JSD, QNT, Mean), the extractor functions below mirror
@@ -18,8 +18,16 @@ import argparse
 import csv
 import importlib.util
 import sys
-from collections import OrderedDict
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_NETHOBENCH_INSTALL = _REPO_ROOT / "nethobench"
+if (_NETHOBENCH_INSTALL / "nethobench" / "__init__.py").is_file():
+    _nb_path = str(_NETHOBENCH_INSTALL.resolve())
+    if _nb_path not in sys.path:
+        sys.path.insert(0, _nb_path)
+
+NETHOBENCH_PKG = _REPO_ROOT / "nethobench" / "nethobench"
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,9 +36,8 @@ from matplotlib.colors import TwoSlopeNorm
 from scipy.linalg import subspace_angles
 from scipy.stats import entropy, kurtosis, skew
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def load_module_from_path(module_name: str, path: Path):
@@ -45,63 +52,37 @@ def load_module_from_path(module_name: str, path: Path):
 
 addm = load_module_from_path(
     "_nethobench_additional_neuro_metrics",
-    REPO_ROOT / "nethobench" / "analysis" / "additional_neuro_metrics.py",
+    NETHOBENCH_PKG / "analysis" / "additional_neuro_metrics.py",
 )
 smc = load_module_from_path(
     "_nethobench_sensitive_metric_candidates",
-    REPO_ROOT / "nethobench" / "analysis" / "sensitive_metric_candidates.py",
+    NETHOBENCH_PKG / "analysis" / "sensitive_metric_candidates.py",
 )
 base = load_module_from_path(
-    "_nethobench_neuro_submetric_visualizations_90_810",
-    REPO_ROOT / "nethobench" / "notebooks" / "neuro_submetric_visualizations_90_810.py",
+    "_neuro_eval_common",
+    Path(__file__).resolve().parent / "neuro_eval_common.py",
 )
 
 
 EPS = 1e-12
 
-SELECTED_METRICS = OrderedDict(
-    [
-        ("distribution", ["KL_or_JSD_score01", "QNT_score01", "MOM_score01", "Mean_score01"]),
-        ("temporal_spectral", ["TRJDIST_score01"]),
-        (
-            "relational",
-            [
-                "GRAPH_score01",
-                "CrossRegionMI_score01",
-                "LaggedCovariance_score01",
-                "ImpulseResponse_score01",
-            ],
-        ),
-        ("geometry", ["MANI_score01", "SubspaceAngle_score01"]),
-        (
-            "state_dynamics",
-            [
-                "LatentStateOccupancyK11_score01",
-                "LatentStateOccupancyK12_score01",
-                "LatentStateTransitionLag1K11_score01",
-                "LatentStateTransitionLag2K11_score01",
-                "LatentStateTransitionLag3K11_score01",
-            ],
-        ),
-    ]
-)
+SELECTED_METRICS = base.SELECTED_METRICS
 
 
 def parse_args() -> argparse.Namespace:
-    package_dir = REPO_ROOT / "nethobench"
     parser = argparse.ArgumentParser(
         description="Generate metric-specific Nethobench diagnostic figures for 90_810."
     )
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=package_dir / "evaluation_results" / "90_810",
-        help="Directory containing the 90_810 .npy tensors.",
+        default=_REPO_ROOT / "evaluation_results" / "90_810" / "seed_102",
+        help="Directory containing the 90_810 .npy tensors (GT/prediction stacks).",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=package_dir / "outputs" / "neuro_metric_specific_visualizations_90_810",
+        default=_REPO_ROOT / "output" / "neuro_metric_specific_visualizations_90_810",
         help="Directory for metric-specific SVGs and manifest.",
     )
     parser.add_argument(

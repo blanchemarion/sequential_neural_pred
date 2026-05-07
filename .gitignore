@@ -32,3 +32,4 @@ checkpoints_TF/
 checkpoints_TF_dff/
 hf_release/
 scripts/
+nethobench/

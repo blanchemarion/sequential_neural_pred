@@ -9,15 +9,24 @@ four contiguous blocks along the **sequence (batch) axis** using ``numpy.array_s
 use the **mean** of those four scores; **error bars** show the standard error of
 that mean (ddof=1, n=4) when at least two finite split values exist.
 
-Outputs are written under ``outputs/neuro_subscores_from_npy_merged_4split/`` so the
-original notebook caches and figures are left untouched.
+Defaults read tensors from ``evaluation_results/90_810/seed_102`` and write plots
+and caches under ``output/neuro_subscores_from_npy_merged_4split/`` at the repo root.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 from pathlib import Path
+
+# Vendored package lives at <repo>/nethobench/nethobench; setuptools layout uses <repo>/nethobench on PYTHONPATH.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_NETHOBENCH_INSTALL = _REPO_ROOT / "nethobench"
+if (_NETHOBENCH_INSTALL / "nethobench" / "__init__.py").is_file():
+    _nb_path = str(_NETHOBENCH_INSTALL.resolve())
+    if _nb_path not in sys.path:
+        sys.path.insert(0, _nb_path)
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -28,12 +37,11 @@ import nethobench
 from nethobench import compute_neuro_scores
 
 # ---------------------------------------------------------------------------
-# Paths and toggles (aligned with the notebook)
+# Paths and toggles
 # ---------------------------------------------------------------------------
-package_dir = Path(nethobench.__file__).resolve().parent
-data_dir = package_dir / "data"
 sub_data_dir = "90_810"  # "90_1170"
-outputs_dir = package_dir / "outputs" / "neuro_subscores_from_npy_merged_4split"
+data_dir = _REPO_ROOT / "evaluation_results" / sub_data_dir / "seed_102"
+outputs_dir = _REPO_ROOT / "output" / "neuro_subscores_from_npy_merged_4split"
 csv_dir = outputs_dir / "organized_csv"
 CONTEXT_STEPS_TO_DROP = 0
 
@@ -54,16 +62,16 @@ RUN_HORIZON_SCORES = True
 # ---------------------------------------------------------------------------
 # Model paths and GT routing (same as notebook)
 # ---------------------------------------------------------------------------
-gt_path_bench = data_dir / sub_data_dir / "long_ground_truth_90_810.npy"
-gt_path_sequifier = data_dir / sub_data_dir / "long_ground_truth_sequifier_last100.npy"
+gt_path_bench = data_dir / "long_ground_truth_90_810.npy"
+gt_path_sequifier = data_dir / "long_ground_truth_sequifier_last100.npy"
 
 model_files = {
-    "VAR": data_dir / sub_data_dir / "long_predictions_90_810_VAR_BASELINE.npy",
-    "1_step": data_dir / sub_data_dir / "long_predictions_90_810_1_step.npy",
-    "AR": data_dir / sub_data_dir / "long_predictions_90_810_AR_KV.npy",
-    "TF": data_dir / sub_data_dir / "long_predictions_90_810_TF.npy",
-    "TF_QL_0.08_KL_0.02": data_dir / sub_data_dir / "long_predictions_90_810_TF_QTL_0.08_KL_0.02.npy",
-    "sequifier": data_dir / sub_data_dir / "long_predictions_sequifier_last100.npy",
+    "VAR": data_dir / "long_predictions_90_810_VAR_BASELINE.npy",
+    "1_step": data_dir / "long_predictions_90_810_1_step.npy",
+    "AR": data_dir / "long_predictions_90_810_AR_KV.npy",
+    "TF": data_dir / "long_predictions_90_810_TF.npy",
+    "TF_QL_0.08_KL_0.02": data_dir / "long_predictions_90_810_TF_QTL_0.08_KL_0.02.npy",
+    "sequifier": data_dir / "long_predictions_sequifier_last100.npy",
 }
 
 MODEL_TO_GT = {
@@ -520,8 +528,8 @@ if RUN_EXAMPLE_OVERLAY_PLOT:
     }
 
     example_gt_paths = {
-        "bench": data_dir / EXAMPLE_SUBDIR / f"long_ground_truth_{EXAMPLE_SUBDIR}.npy",
-        "sequifier": data_dir / EXAMPLE_SUBDIR / "long_ground_truth_sequifier_last100.npy",
+        "bench": data_dir / f"long_ground_truth_{EXAMPLE_SUBDIR}.npy",
+        "sequifier": data_dir / "long_ground_truth_sequifier_last100.npy",
     }
 
     MODEL_TO_EXAMPLE_GT = {
@@ -534,12 +542,12 @@ if RUN_EXAMPLE_OVERLAY_PLOT:
     }
 
     example_model_paths = {
-        "sequifier": data_dir / EXAMPLE_SUBDIR / "long_predictions_sequifier_last100.npy",
-        "TF_QL_0.08_KL_0.02": data_dir / EXAMPLE_SUBDIR / f"long_predictions_{EXAMPLE_SUBDIR}_TF_QTL_0.08_KL_0.02.npy",
-        "TF": data_dir / EXAMPLE_SUBDIR / f"long_predictions_{EXAMPLE_SUBDIR}_TF.npy",
-        "AR": data_dir / EXAMPLE_SUBDIR / f"long_predictions_{EXAMPLE_SUBDIR}_AR_KV.npy",
-        "1_step": data_dir / EXAMPLE_SUBDIR / f"long_predictions_{EXAMPLE_SUBDIR}_1_step.npy",
-        "VAR": data_dir / EXAMPLE_SUBDIR / f"long_predictions_{EXAMPLE_SUBDIR}_VAR_BASELINE.npy",
+        "sequifier": data_dir / "long_predictions_sequifier_last100.npy",
+        "TF_QL_0.08_KL_0.02": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_TF_QTL_0.08_KL_0.02.npy",
+        "TF": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_TF.npy",
+        "AR": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_AR_KV.npy",
+        "1_step": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_1_step.npy",
+        "VAR": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_VAR_BASELINE.npy",
     }
 
     run_colors_ex = {

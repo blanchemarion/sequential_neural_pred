@@ -13,3 +13,7 @@ tqdm>=4.65.0
 # Used by inference_all_regimes.py (stats / PCA)
 scipy>=1.10.0
 scikit-learn>=1.3.0
+
+# Vendored ./nethobench neuro composites & visualize scripts (pip install -e ./nethobench optional)
+umap-learn>=0.5
+ripser>=0.6.12

@@ -8,8 +8,8 @@ predictions are split into four contiguous sequence chunks; ``compute_neuro_scor
 runs on each chunk; summaries and plots use the **mean** across chunks with **SEM**
 (ddof=1, n=4) as error bars.
 
-Outputs go to ``outputs/neuro_subscores_from_npy_2p_merged_4split/`` (the original
-notebook output directory is untouched).
+Defaults read tensors from ``evaluation_results/90_240/seed_102`` and write plots
+and caches under ``output/neuro_subscores_from_npy_2p_merged_4split/`` at the repo root.
 
 The upstream notebook has no polar family-radar cell; this script includes the
 bar chart, metric dot plot, horizon sweep, and a compact example overlay aligned
@@ -20,9 +20,17 @@ another subfolder/model; here it matches the scoring tensors).
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_NETHOBENCH_INSTALL = _REPO_ROOT / "nethobench"
+if (_NETHOBENCH_INSTALL / "nethobench" / "__init__.py").is_file():
+    _nb_path = str(_NETHOBENCH_INSTALL.resolve())
+    if _nb_path not in sys.path:
+        sys.path.insert(0, _nb_path)
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -37,10 +45,9 @@ from nethobench.analysis.score_definitions import NEURO_FAMILY_METRICS
 # ---------------------------------------------------------------------------
 # Paths and toggles (aligned with neuro_subscores_from_npy_2p.ipynb cell 1)
 # ---------------------------------------------------------------------------
-package_dir = Path(nethobench.__file__).resolve().parent
-data_dir = package_dir / "data"
 sub_data_dir = "90_240"
-outputs_dir = package_dir / "outputs" / "neuro_subscores_from_npy_2p_merged_4split"
+data_dir = _REPO_ROOT / "evaluation_results" / sub_data_dir / "seed_102"
+outputs_dir = _REPO_ROOT / "output" / "neuro_subscores_from_npy_2p_merged_4split"
 csv_dir = outputs_dir / "organized_csv"
 CONTEXT_STEPS_TO_DROP = 0
 
@@ -61,14 +68,14 @@ RUN_HORIZON_SCORES = True
 # ---------------------------------------------------------------------------
 # Ground truth and models (notebook cell 2)
 # ---------------------------------------------------------------------------
-gt_path_bench = data_dir / sub_data_dir / "long_ground_truth_POCO_LITE.npy"
+gt_path_bench = data_dir / "long_ground_truth_MLP_2p.npy"
 
 model_files = {
-    "POCO_1_step": data_dir / sub_data_dir / "long_predictions_POCO_LITE_1_step.npy",
+    "MLP_2p": data_dir / "long_predictions_MLP_2p.npy",
 }
 
 MODEL_TO_GT = {
-    "POCO_1_step": "bench",
+    "MLP_2p": "bench",
 }
 
 

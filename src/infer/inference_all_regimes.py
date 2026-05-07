@@ -1,175 +1,37 @@
 """
-Comprehensive inference evaluation script for both short and long window performance.
+Long-horizon autoregressive inference evaluation.
 
-This script evaluates model performance on:
-1. Short windows: Single autoregressive inference loop (T_out length)
-2. Long windows: Multiple autoregressive inference loops (800+ timesteps)
+Loads validation tensors saved during training, runs KV-cache rollouts to a fixed
+prediction length per sequence, writes stacked ``.npy`` archives and NeuroBench-style
+CSVs for the forecast window, and saves example overlay SVGs.
 
-For reproducibility, multiple fixed random seeds are used.
+Configure ``MODES``, ``SELECTED_CHECKPOINTS``, and ``SEEDS`` below. Run from the
+repository root so checkpoint and ``data_processed`` paths resolve.
 """
 from __future__ import annotations
 
-import torch
-import numpy as np
-from pathlib import Path
 import random
-import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
-import matplotlib as mpl
-import pandas as pd
-import json
-from typing import Dict, List, Tuple
-import seaborn as sns
-import torch.nn.functional as F
 import sys
+from pathlib import Path
 
-from itertools import combinations
-try:
-    from scipy.stats import mannwhitneyu, ttest_ind
-except Exception as e:
-    mannwhitneyu = None
-    ttest_ind = None
-
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
-from helpers.preprocess_helpers import (
-    load_data,
-    reshape_to_examples,
-    split_by_sequences,
-    create_dataloaders,
-    filter_examples_by_nan,
-    apply_normalization_nct
-)
-
-
 from models.model_KV_cached import create_model_cached
-try:
-    from models.models import create_model  # legacy non-cached transformer; optional
-except ImportError:  # pragma: no cover - models.models removed in current layout
-    create_model = None
 
 NUM_SEQUENCES = 222
-SHORT_PRED_LENGTH = 90  # Fixed prediction length for short window
-LONG_PRED_LENGTH = 720  # Fixed prediction length for long window
-SEEDS = [102] #[102, 103, 104]
+LONG_PRED_LENGTH = 720
+SEEDS = [102]
 
-
-#MODES = ["AR_KV"]
-#MODE_COLORS = {"AR_KV": "#2E86AB"}
-#MODES = ["TF"]
-#MODE_COLORS = {"TF": "#2E86AB"}
-#MODES = ["1_step"]
-#MODE_COLORS = {"1_step": "#2E86AB"}
-#MODES = ["TF_QTL_0.1"]
-#MODE_COLORS = {"TF_QTL_0.1": "#2E86AB"}
-#MODES = ["TF_QTL_0.08_KL_0.02"]
-#MODE_COLORS = {"TF_QTL_0.08_KL_0.02": "#2E86AB"}
-#MODES = ["TF_QTL_0.08_KL_0.02_MOM_0.03"]
-MODES = ["TF_QTL_0.08_KL_0.02_TRJ_0.03"]
-#MODE_COLORS = {"TF_QTL_0.08_KL_0.02_MOM_0.03": "#2E86AB"}
-MODE_COLORS = {"TF_QTL_0.08_KL_0.02_TRJ_0.03": "#2E86AB"}
-
-def load_existing_long_neurobench_runs(
-    main_output_dir: Path,
-    *,
-    config_name: str,
-    modes: list[str],
-    seeds: list[int],
-    show_bars: bool = False,
-) -> dict:
-    """
-    Build all_results_by_seed[config_name]["long"][mode] by reading existing files.
-
-    It will:
-      - prefer loading scored CSVs if present (fast)
-      - otherwise, it will generate scored CSVs from saved .npy, then score (still no model)
-
-    Expected per seed dir:
-      - long_predictions_{config_name}_{mode}.npy
-      - long_ground_truth_{config_name}.npy
-    Optionally already present:
-      - long_predictions_scored_{mode}.csv
-      - long_ground_truth_scored.csv
-    """
-    main_output_dir = Path(main_output_dir)
-
-    all_results_by_seed = {
-        config_name: {
-            "short": {m: [] for m in modes},
-            "long":  {m: [] for m in modes},
-        }
-    }
-
-    for seed in seeds:
-        seed_dir = main_output_dir / f"seed_{seed}"
-        if not seed_dir.exists():
-            print(f"⚠ Missing seed dir: {seed_dir}")
-            continue
-
-        # GT is shared across modes (you save it once)
-        gt_npy = seed_dir / f"long_ground_truth_{config_name}.npy"
-        if not gt_npy.exists():
-            print(f"⚠ Missing GT: {gt_npy}")
-            continue
-        gt_full = np.load(gt_npy)  # shape (N, T_in+Tpred, n_vars)
-
-        for mode in modes:
-            pred_npy = seed_dir / f"long_predictions_{config_name}_{mode}.npy"
-            if not pred_npy.exists():
-                print(f"⚠ Missing pred: {pred_npy}")
-                continue
-            pred_full = np.load(pred_npy)
-
-            # Use the *prediction window only* (same convention as evaluate_long_window)
-            # IMPORTANT: if you changed pred_start elsewhere, mirror it here.
-            # Here pred_start = T_in = 90 for your config.
-            # If you want to infer it: use pred_full.shape[1] - LONG_PRED_LENGTH as pred_start
-            # but in your pipeline T_in is fixed.
-            #pred_start = pred_full.shape[1] - LONG_PRED_LENGTH
-            T_in = int(config_name.split("_")[0])  # for "90_360"
-            pred_start = T_in
-
-            assert pred_full.shape[1] >= pred_start + LONG_PRED_LENGTH
-
-            pred_scored = pred_full[:, pred_start:, :]
-            gt_scored   = gt_full[:, pred_start:, :]
-
-            # Align just in case
-            Tpred = min(pred_scored.shape[1], gt_scored.shape[1])
-            V = min(pred_scored.shape[2], gt_scored.shape[2])
-            pred_scored = pred_scored[:, :Tpred, :V]
-            gt_scored   = gt_scored[:, :Tpred, :V]
-
-            # scored CSVs (reuse if they exist, else create them)
-            pred_csv = seed_dir / f"long_predictions_scored_{mode}.csv"
-            gt_csv   = seed_dir / "long_ground_truth_scored.csv"
-
-            if not pred_csv.exists():
-                region_names = [f"roi_{i}" for i in range(pred_scored.shape[2])]
-                save_sequences_to_neurobench_csv(pred_scored, pred_csv, region_names=region_names)
-
-            if not gt_csv.exists():
-                region_names = [f"roi_{i}" for i in range(gt_scored.shape[2])]
-                save_sequences_to_neurobench_csv(gt_scored, gt_csv, region_names=region_names)
-
-            global_scores, seq_scores, mean_scores, std_scores = compute_core_scores(
-                predictions_csv=pred_csv,
-                ground_truth_csv=gt_csv,
-                show_bars=show_bars,
-            )
-
-            all_results_by_seed[config_name]["long"][mode].append({
-                "global_scores": global_scores,
-                "sequence_level_scores": seq_scores,
-                "mean_scores": mean_scores,
-                "std_scores": std_scores,
-            })
-
-    return all_results_by_seed
-
+MODES = ["TF_QTL_0.08_KL_0.02"]
 
 
 def save_sequences_to_neurobench_csv(arr: np.ndarray, csv_path: str | Path, region_names=None):
@@ -197,16 +59,6 @@ def save_sequences_to_neurobench_csv(arr: np.ndarray, csv_path: str | Path, regi
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(csv_path, index=False)
     return csv_path
-
-def load_norm_stats(stats_base_path: str):
-    base = Path(stats_base_path).with_suffix("")
-    mean_path   = base.parent / f"{base.name}_mean.npy"
-    std_path    = base.parent / f"{base.name}_std.npy"
-
-    mean = np.load(mean_path)
-    std  = np.load(std_path)
-
-    return mean, std
 
 
 def _resolve_existing_file(path_value: str | None, repo_root: Path) -> Path | None:
@@ -403,30 +255,26 @@ def prepare_input_and_gt(val_examples, val_seq_indices, example_idx, T_in, targe
 
 
 def evaluate_long_window(
-    model, checkpoint_name, mode, T_in, T_out,
-    val_examples, val_seq_indices, selected_indices,
-    output_dir, region_names, device, seed, target_pred_length=800, config_name=None
-):
+    model,
+    checkpoint_name: str,
+    mode: str,
+    T_in: int,
+    T_out: int,
+    val_examples,
+    val_seq_indices,
+    selected_indices,
+    output_dir: Path,
+    device: torch.device,
+    seed: int,
+    target_pred_length: int = 800,
+    config_name: str | None = None,
+) -> None:
     """
-    Evaluate model performance on long windows (fixed 800 timestep prediction).
+    Autoregressive rollout to ``T_in + target_pred_length`` timesteps per sequence.
 
-    Long-horizon metrics focus on:
-      - Local accuracy & drift (chunked MAE)
-      - Variance / amplitude preservation
-      - Temporal dynamics (PSD)
-      - Population manifold structure (latent covariance)
-
-    NEW:
-      - baseline_per_sequence: metrics computed for GT vs GT (the "optimum" reference)
-        so you can add a "GT" box in plots.
+    Saves full-length predictions/GT as ``.npy``, then writes scored CSVs for the
+    forecast segment only (indices ``T_in:``).
     """
-    import numpy as np
-    import torch
-    import json
-    import pandas as pd
-    from pathlib import Path
-    from sklearn.decomposition import PCA
-
     print("\n" + "=" * 80)
     print(f"LONG WINDOW EVALUATION: {checkpoint_name} (SEED={seed})")
     print(f"  T_out={T_out}, generating {target_pred_length} timesteps")
@@ -449,8 +297,6 @@ def evaluate_long_window(
         )
 
         input_tensor = input_tensor.to(device)
-        gt_tensor = torch.tensor(gt_sequence, dtype=torch.float32).unsqueeze(0)  # (1, T, V)
-        gt_tensor = gt_tensor.to(device)
 
         long_pred = generate_long_sequence(model, input_tensor, target_length, T_in, T_out, device)
 
@@ -577,7 +423,7 @@ def plot_prediction_examples(
                 linewidth=1.2,
                 alpha=0.45,
                 #label=f"{mode} prediction" if r == 0 else None,
-                label="1_step prediction" if r == 0 else None,
+                label="Prediction" if r == 0 else None,
                 zorder=3,
             )
 
@@ -610,97 +456,16 @@ def plot_prediction_examples(
     print(f"  ✓ Saved {n_sequences} example plots for {mode} ({window_type})")
 
 
-
-def discover_checkpoint_pairs():
-    """
-    Discover checkpoint pairs (AR and TL with same T_in/T_out).
-    
-    Returns:
-        List of dicts with 'AR' and 'TL' checkpoint paths and config info
-    """
-
-    checkpoint_pairs = {}
-    
-    for ckpt_dir in sorted(Path(".").glob("checkpoints_*")):
-        if not ckpt_dir.is_dir():
-            continue
-        
-        ckpt_file = ckpt_dir / "final_model.pt"
-        if not ckpt_file.exists():
-            continue
-        
-        # Parse checkpoint folder name
-        # Expected format: checkpoints_AR_T_in_T_out or checkpoints_TL_T_in_T_out
-        parts = ckpt_dir.name.split('_')
-        if len(parts) < 4:
-            continue
-        
-        mode = parts[1]
-        if mode not in MODES:
-            continue
-                
-        # Extract T_in and T_out
-        try:
-            T_in = int(parts[2])
-            T_out = int(parts[3])
-        except (ValueError, IndexError):
-            continue
-        
-        config_key = f"{T_in}_{T_out}"
-        
-        if config_key not in checkpoint_pairs:
-            checkpoint_pairs[config_key] = {}
-        
-        checkpoint_pairs[config_key][mode] = {
-            'path': ckpt_file,
-            'folder_name': ckpt_dir.name,
-            'T_in': T_in,
-            'T_out': T_out
-        }
-    
-    # Convert to list and filter for pairs that have both AR and TL
-    pairs = []
-
-    for config_key, pair in sorted(checkpoint_pairs.items()):
-        if all(m in pair for m in MODES):
-            pairs.append({
-                "config_name": config_key,
-                "modes": {m: pair[m] for m in MODES}
-            })
-        else:
-            missing = [m for m in MODES if m not in pair]
-            print(f"⚠ Warning: Configuration {config_key} missing {missing} checkpoint(s)")
-    
-    return pairs
-
-
-
 def main():
     print("="*80)
     print("COMPREHENSIVE MODEL INFERENCE EVALUATION")
     print("="*80)
 
 
-    """SELECTED_CHECKPOINTS = [
-        {
-            "config_name": "90_1170",
-            "1_step": "checkpoints_AR_90_1_dyna",
-            "OS": "checkpoints_OS_90_90_dyna",
-            "TF": "checkpoints_TF_90_90_dyna",
-            "AR": "checkpoints_AR_90_90_dyna", 
-        }
-    ]"""
     SELECTED_CHECKPOINTS = [
         {
             "config_name": "90_810",
-            #"AR_KV": "checkpoints_ar_kv_2",
-            #"TF": "checkpoints_tf_2",
-            #"TF_QTL_0.1": "checkpoints_TF_QTL_0.1",
-            #"TF_QTL_0.08_KL_0.02": "checkpoints_TF_QTL_0.08_KL_0.02",
-            #"TF_QTL_0.08_KL_0.02_MOM_0.03": "checkpoints_TF_QTL_0.08_KL_0.02_MOM_0.03",
-            "TF_QTL_0.08_KL_0.02_TRJ_0.03": "checkpoints_TF_QTL_0.08_KL_0.02_TRJ_0.03",
-            #"MIX_TF_AR_KV": "checkpoints_mix_tf_ar",
-            #"1_step": "checkpoints_1_step",
+            "TF_QTL_0.08_KL_0.02": "checkpoints_TF_QTL_0.08_KL_0.02",
         }
     ]
 
@@ -710,8 +475,7 @@ def main():
     print(f"\nDevice: {device}")
     print(f"Number of sequences per evaluation: {NUM_SEQUENCES}")
     print(f"Seeds: {SEEDS}")
-    print(f"Short window prediction length: {SHORT_PRED_LENGTH}")
-    print(f"Long window prediction length: {LONG_PRED_LENGTH}")
+    print(f"Long rollout length (prediction timesteps): {LONG_PRED_LENGTH}")
 
     # ------------------------------------------------------------
     # Build checkpoint_pairs (unified structure: {"config_name", "modes": {...}})
@@ -776,39 +540,15 @@ def main():
         print(f"  - {p['config_name']}: modes={list(p['modes'].keys())}")
 
     # ------------------------------------------------------------
-    # Load data config from first available mode (prefer AR, else first mode)
+    # Load validation tensors (paths from checkpoint config or data_processed fallback)
     # ------------------------------------------------------------
     first_pair = checkpoint_pairs[0]
-    pick_mode = "AR" if "AR" in first_pair["modes"] else list(first_pair["modes"].keys())[0]
+    pick_mode = next(iter(first_pair["modes"]))
     first_checkpoint_path = first_pair["modes"][pick_mode]["path"]
 
     print("\n" + "="*80)
     print(f"LOADING DATA (from {pick_mode}: {first_checkpoint_path})")
     print("="*80)
-
-    """checkpoint = torch.load(first_checkpoint_path, map_location=device, weights_only=False)
-    config = checkpoint["config"]
-
-    data_array = load_data(config["data_path"])
-    examples, sequence_indices = reshape_to_examples(data_array)
-    T_in_common = first_pair["modes"][pick_mode]["T_in"]
-    T_out_filter = max(first_pair["modes"][m]["T_out"] for m in MODES)
-    examples, sequence_indices = filter_examples_by_nan(
-        examples, sequence_indices,
-        T_in=T_in_common,
-        T_out=T_out_filter
-    )
-    train_examples, val_examples, _, val_seq_indices = split_by_sequences(
-        examples,
-        sequence_indices,
-        train_ratio=config["train_ratio"],
-        random_seed=config["random_seed"],
-    )
-
-    # --- Normalize after split 
-    mean, std = load_norm_stats("data/train_norm_stats.npy")
-    train_examples = apply_normalization_nct(train_examples, mean, std)
-    val_examples   = apply_normalization_nct(val_examples,   mean, std)"""
 
     ckpt = torch.load(first_checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
@@ -829,36 +569,17 @@ def main():
         print("   Expected checkpoint config fields or data_processed/processed_val_<run_stem>.npy fallback.")
         return
 
-    metadata_path = Path("data/data_organized_metadata.json")
-    region_names = None
-    if metadata_path.exists():
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-        region_names = metadata.get("region_names", None)
-        if region_names:
-            print(f"  Loaded {len(region_names)} region names")
-
     # ------------------------------------------------------------
-    # Evaluation loops - All results saved to 90_90 folder
+    # Long-window evaluation → evaluation_results/<config layout>/seed_*
     # ------------------------------------------------------------
     base_output_dir = Path("evaluation_results")
-    # Use 90_90 as the main output directory
-    main_output_dir = base_output_dir / "90_810" #"90_90"
-
-    all_results = {}
-    all_results_by_seed = {}
+    main_output_dir = base_output_dir / "90_810"
 
     for pair_idx, pair in enumerate(checkpoint_pairs):
         config_name = pair["config_name"]
         print("\n" + "="*80)
         print(f"PROCESSING CONFIG {pair_idx+1}/{len(checkpoint_pairs)}: {config_name}")
         print("="*80)
-
-        all_results[config_name] = {"short": {}, "long": {}}
-        all_results_by_seed[config_name] = {
-            "short": {m: [] for m in MODES},
-            "long":  {m: [] for m in MODES},
-        }
 
         for seed in SEEDS:
             print(f"\n{'='*60}")
@@ -902,19 +623,25 @@ def main():
                 output_dir.mkdir(parents=True, exist_ok=True)
 
                 print(f"\n  Loading {config_name} {mode} model...")
-                model, model_config = create_inference_model(
+                model, _ = create_inference_model(
                     ckpt_info["path"], T_in, T_out, device
                 )
 
-                long_scores = evaluate_long_window(
-                    model, ckpt_info["folder_name"], mode, T_in, T_out,
-                    val_examples, val_seq_indices, selected_indices,
-                    output_dir, region_names, device, seed, LONG_PRED_LENGTH, config_name
+                evaluate_long_window(
+                    model,
+                    ckpt_info["folder_name"],
+                    mode,
+                    T_in,
+                    T_out,
+                    val_examples,
+                    val_seq_indices,
+                    selected_indices,
+                    output_dir,
+                    device,
+                    seed,
+                    LONG_PRED_LENGTH,
+                    config_name,
                 )
-                all_results_by_seed[config_name]["long"][mode].append(long_scores)
-
-                if seed == SEEDS[0]:
-                    all_results[config_name]["long"][mode] = long_scores
 
                 if seed == SEEDS[0]:
                     long_pred = np.load(output_dir / f"long_predictions_{config_name}_{mode}.npy")

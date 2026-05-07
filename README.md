@@ -76,12 +76,16 @@ Defaults inside **`prepare.py`** target tensors aligned with `train_all_regimes.
 
 ## Evaluation and visualization
 
+**Nethobench dependency.** Neuro visualization and scoring scripts import the **`nethobench`** Python package (`compute_neuro_scores`, neuro pipeline helpers). This repository **expects a vendored copy at the repository root**: clone or copy the Nethobench sources into **`nethobench/`** next to `src/` and `globals.json` (setuptools layout so imports resolve from `<repo>/nethobench`). Scripts under **`src/visualize/`** prepend that directory to `sys.path`, so a separate **`pip install`** is not required. Alternatively you may **`pip install -e ./nethobench`** into your environment and rely on the normal import path.
+
+Install **`requirements.txt`** (includes `umap-learn` and `ripser` used by full neuro composites).
+
 - **`src/infer/inference_all_regimes.py`** — short-window versus long-window autoregressive evaluation, qualitative overlays, and metric summaries tuned inside the script (modes list and horizons).
 - **`src/visualize/plot_all_configs_learning_curves.py`** — aggregate learning curves across exported histories/checkpoints.
-- **`src/visualize/neuro_metric_specific_visualizations_90_810.py`** / **`neuro_subscores_from_npy_with_sequifier_4split.py`** — neuroscience-oriented dashboards from stacked prediction arrays.
+- **`src/visualize/neuro_metric_specific_visualizations_90_810.py`** / **`neuro_subscores_from_npy_with_sequifier_4split.py`** — neuroscience-oriented dashboards from stacked prediction arrays; official **`compute_neuro_scores`** paths write CSV family/submetric tables where enabled.
 - **`src/visualize/neuro_subscores_from_npy_2p_4split.py`** — analogous tooling tuned for two-photon benchmark layouts referenced inside that script.
 
-Point these utilities at **your exported prediction tensors** produced by the inference scripts (layouts described in each file’s module docstring).
+**Tensor paths.** Point these utilities at **your** stacked `.npy` exports (layouts in each script’s docstring). Defaults target **`evaluation_results/<layout>/seed_102/`** at the repo root; override with each script’s CLI or constants. Figures and caches go under **`output/`** (outside `src/`), not under `nethobench/`.
 
 ---
 
@@ -120,6 +124,7 @@ src/
   train/             # sensitivity-analysis trainer, multi-regime trainer, baselines
   infer/             # sensitivity-analysis rollout engine, regime evaluator, baseline/MLP2P inference
   visualize/         # publication-style plots and neuro metric summaries
+nethobench/            # vendored Nethobench package (neuro benchmark scoring)
 globals.json
 requirements.txt
 run_sensitity.sh

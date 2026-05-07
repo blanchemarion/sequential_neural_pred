@@ -25,7 +25,10 @@ checkpoints_TF_scaling/
 checkpoints_TF_mix_scaling/
 checkpoints_1_step_scaling/
 checkpoints_AR_scaling/
+checkpoints_MLP_2P/
 output/
 checkpoints_AR_KV/
 checkpoints_TF/
 checkpoints_TF_dff/
+hf_release/
+scripts/

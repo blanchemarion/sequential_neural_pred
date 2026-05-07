@@ -23,7 +23,7 @@ _PREP_DIR = Path(__file__).resolve().parent
 if str(_PREP_DIR) not in sys.path:
     sys.path.insert(0, str(_PREP_DIR))
 
-from prepare_data import (
+from prepare_scaling import (
     brain_region_sample_rng,
     export_organized_data,
     list_brain_region_columns,

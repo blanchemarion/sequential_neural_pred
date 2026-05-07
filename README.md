@@ -55,7 +55,7 @@ Optional **`src/prepare/sample_parquet_1pct.py`** subsamples sequences (~1% rows
 
 ## Pipeline B — Multi-regime Transformer training (`prepare.py` → `train_all_regimes.py`)
 
-For richer supervisory mixtures (teacher forcing, autoregressive self-feedback, one-shot blocks—see docstrings in `src/models/models.py`):
+For richer supervisory mixtures (teacher forcing, autoregressive self-feedback—see docstrings in `src/models/models_KV_cached.py`):
 
 ```bash
 python src/prepare/prepare.py

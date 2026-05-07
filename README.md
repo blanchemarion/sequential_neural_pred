@@ -10,7 +10,7 @@ The code supports several training–inference **regimes** (including pure autor
 
 - **Task.** Predict future activity conditioned on an observed prefix of length $\(T_{\mathrm{in}}\)$. Outputs use horizon $\(T_{\mathrm{out}}\)$.
 - **Data.** Wide-format tabular exports keyed by sequence and timestep identifiers (`sequenceId`, `itemPosition`), with one column per region or neuron. The preparation utilities reshape contiguous subsequences into 4D arrays suited to batched training.
-- **Models.** Core neural predictor: causal Transformer encoder over concatenated history and prediction horizon (`src/models/models.py`), plus a **KV-cache variant** intended for efficient long rollouts (`src/models/model_KV_cached.py`). Auxiliary **`train_var_baseline.py`** / **`inference_var_baseline.py`** implement vector-autoregressive-style linear comparisons (`src/models/model_var_baseline.py`).
+- **Models.** Core neural predictor: causal Transformer encoder over concatenated history and prediction horizon (`src/models/models.py`), with **KV-cache** optimization intended for efficient long rollouts (`src/models/model_KV_cached.py`). Auxiliary **`train_var_baseline.py`** / **`inference_var_baseline.py`** implement vector-autoregressive-style linear comparisons (`src/models/model_var_baseline.py`).
 - **Two-photon–style traces.** **`train_MLP_2p.py`** and **`inference_MLP_2p.py`** train an **`MLP2P`** architecture (`src/models/mlp_2p.py`): per-neuron temporal embeddings conditioned on a learned population summary, suited to nonnegative continuous fluorescence traces supplied as matrix CSV (rows = neurons, columns = time; see script `--csv_path`).
 
 ---

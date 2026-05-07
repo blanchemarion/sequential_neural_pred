@@ -2,7 +2,7 @@
 
 This repository implements **decoder-only Transformer models** and evaluation tooling for **multi-step forecasting** of population neural activity organized as multivariate time series. It targets recordings observed over many timesteps and summarized per timestep by activity in multiple brain regions or neurons.
 
-The code supports several training–inference **regimes** (including one-shot multi-horizon prediction, pure autoregressive self-feedback, and teacher forcing–style supervision), **scaling analyses** over dataset size and input horizon, optional **linear VAR-style baselines**, and **population-conditioned MLP baselines** on dense two-photon–style traces stored as CSV. Companion **`scaling_law_globals.json`** centralizes paths and hyperparameter defaults so experiments stay reproducible and consistent across preparation, training, and inference scripts.
+The code supports several training–inference **regimes** (including pure autoregressive self-feedback, and teacher forcing–style supervision), **scaling analyses** over dataset size and input horizon, optional **linear VAR-style baselines**, and **population-conditioned MLP baselines** on dense two-photon–style traces stored as CSV. Companion **`scaling_law_globals.json`** centralizes paths and hyperparameter defaults so experiments stay reproducible and consistent across preparation, training, and inference scripts.
 
 ---
 

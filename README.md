@@ -124,7 +124,6 @@ src/
   train/             # sensitivity-analysis trainer, multi-regime trainer, baselines
   infer/             # sensitivity-analysis rollout engine, regime evaluator, baseline/MLP2P inference
   visualize/         # publication-style plots and neuro metric summaries
-nethobench/            # vendored Nethobench package (neuro benchmark scoring)
 globals.json
 requirements.txt
 run_sensitity.sh

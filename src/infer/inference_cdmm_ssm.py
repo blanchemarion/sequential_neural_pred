@@ -168,7 +168,7 @@ def evaluate_long_window(
         f"long_predictions_{config_name}_{mean_mode}.npy"
     )
     outputs["samples_npy"] = output_dir / (
-        f"long_predictions_{config_name}_{sample_mode}.npy"
+        f"long_predictions_{config_name}.npy"
     )
     outputs["ground_truth_npy"] = output_dir / (
         f"long_ground_truth_{config_name}.npy"

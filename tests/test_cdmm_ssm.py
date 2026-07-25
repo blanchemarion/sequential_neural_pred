@@ -17,6 +17,7 @@ if str(SRC) not in sys.path:
 from infer.inference_cdmm_ssm import (
     create_inference_model,
     evaluate_long_window,
+    prediction_output_directory,
 )
 from models.model_KV_cached import create_model_cached
 from models.model_cdmm_ssm import create_cdmm_ssm
@@ -91,6 +92,11 @@ class TestConditionalDeepMarkovSSM(unittest.TestCase):
         self.assertTrue(all(torch.isfinite(gradient).all() for gradient in gradients))
 
     def test_posterior_uses_exact_causal_target_prefix(self):
+        # The production model intentionally initializes the posterior delta
+        # head at zero for a stable q ~= p start. Give the test-only head a
+        # nonzero mapping so target-prefix influence is observable in q means.
+        with torch.no_grad():
+            self.model.posterior_mlp[-1].weight.normal_(mean=0.0, std=0.01)
         changed = self.target.clone()
         changed[:, 10, :] += 50.0
         with torch.no_grad():
@@ -255,6 +261,14 @@ class TestConditionalDeepMarkovSSM(unittest.TestCase):
             )
             means = np.load(outputs["mean_npy"])
             samples = np.load(outputs["samples_npy"])
+            self.assertEqual(
+                outputs["mean_npy"].name,
+                "long_predictions_90_810_cDMM_SSM_mean.npy",
+            )
+            self.assertEqual(
+                outputs["samples_npy"].name,
+                "long_predictions_90_810_cDMM_SSM_samples.npy",
+            )
             self.assertEqual(means.shape, (1, 810, 16))
             self.assertEqual(samples.shape, (6, 1, 810, 16))
             self.assertEqual(means.dtype, np.float32)
@@ -282,6 +296,14 @@ class TestConditionalDeepMarkovSSM(unittest.TestCase):
             if output_dir.exists():
                 output_dir.rmdir()
 
+    def test_prediction_output_directory_nomenclature(self):
+        self.assertEqual(
+            prediction_output_directory(
+                Path("evaluation_results"), 102, 90, 720
+            ),
+            Path("evaluation_results") / "seed_102" / "90_810",
+        )
+
     def test_beta_schedule_latent_support_and_parameter_counts(self):
         self.assertEqual(beta_for_epoch(1, 10, 0.2, 0.3), 0.0)
         self.assertEqual(beta_for_epoch(3, 10, 0.2, 0.3), 0.2)
@@ -307,4 +329,3 @@ class TestConditionalDeepMarkovSSM(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

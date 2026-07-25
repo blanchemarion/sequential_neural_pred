@@ -107,7 +107,7 @@
     "scheduler_anneal_strategy": "cos"
   },
   "inference_gru_ar": {
-    "num_sequences": 10,
+    "num_sequences": 222,
     "long_pred_length": 720,
     "n_plot_examples": 10,
     "seed": 102,
@@ -156,7 +156,7 @@
     "scheduler_anneal_strategy": "cos"
   },
   "inference_cdmm_ssm": {
-    "num_sequences": 10,
+    "num_sequences": 222,
     "num_samples": 6,
     "long_pred_length": 720,
     "n_plot_examples": 10,

@@ -23,6 +23,20 @@ from infer.inference_var_baseline import (
 from models.model_gru_ar import create_gru_ar
 
 
+def prediction_output_directory(
+    output_root: Path,
+    seed: int,
+    context_length: int,
+    target_sequence_length: int,
+) -> Path:
+    total_sequence_length = int(context_length) + int(target_sequence_length)
+    return (
+        Path(output_root)
+        / f"{int(context_length)}_{total_sequence_length}"
+        / f"seed_{int(seed)}"
+    )
+
+
 def create_inference_model(
     checkpoint_path: Path, device: torch.device
 ) -> tuple[torch.nn.Module, dict]:
@@ -112,7 +126,7 @@ def evaluate_long_window(
     if not np.isfinite(predictions).all():
         raise ValueError("GRU_AR predictions contain NaN or Inf")
 
-    config_name = f"{t_in}_{target_pred_length}"
+    config_name = f"{t_in}_{t_in + target_pred_length}"
     mode = "GRU_AR"
     output_dir.mkdir(parents=True, exist_ok=True)
     np.save(
@@ -209,6 +223,12 @@ def main(argv: list[str] | None = None) -> None:
 
     val_path = Path(config["processed_val_examples_path"])
     sequence_path = Path(config["processed_val_seq_indices_path"])
+
+    if not val_path.is_file():
+        val_path = root / "data_processed" / val_path.name
+    if not sequence_path.is_file():
+        sequence_path = root / "data_processed" / sequence_path.name
+
     val_examples = np.load(val_path)
     val_sequence_indices = np.load(sequence_path).astype(np.int64, copy=False)
     if val_examples.ndim != 3 or val_examples.shape[1] != int(config["n_vars"]):
@@ -224,8 +244,9 @@ def main(argv: list[str] | None = None) -> None:
         torch.cuda.manual_seed_all(seed)
 
     count = min(int(args.num_sequences), len(val_examples))
-    config_name = f"{t_in}_{int(args.long_pred_length)}"
-    output_dir = output_root / config_name / f"seed_{seed}"
+    output_dir = prediction_output_directory(
+        output_root, seed, t_in, int(args.long_pred_length)
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     index_path = output_dir.parent / f"selected_indices_N{count}_seed{seed}.npy"
     if index_path.exists():

@@ -14,7 +14,11 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from infer.inference_gru_ar import create_inference_model, evaluate_long_window
+from infer.inference_gru_ar import (
+    create_inference_model,
+    evaluate_long_window,
+    prediction_output_directory,
+)
 from models.model_KV_cached import create_model_cached
 from models.model_gru_ar import create_gru_ar
 
@@ -156,8 +160,8 @@ class TestGRUAR(unittest.TestCase):
     def test_inference_output_matches_existing_baseline_layout(self):
         output_dir = ROOT / "tests" / "_tmp_gru_ar_output"
         expected_names = (
-            "long_predictions_90_720_GRU_AR.npy",
-            "long_ground_truth_90_720.npy",
+            "long_predictions_90_810_GRU_AR.npy",
+            "long_ground_truth_90_810.npy",
             "long_predictions_scored_GRU_AR.csv",
             "long_ground_truth_scored.csv",
         )
@@ -180,7 +184,7 @@ class TestGRUAR(unittest.TestCase):
                 {path.name for path in output_dir.iterdir()}, set(expected_names)
             )
             full_prediction = np.load(
-                output_dir / "long_predictions_90_720_GRU_AR.npy"
+                output_dir / "long_predictions_90_810_GRU_AR.npy"
             )
             self.assertEqual(full_prediction.shape, (1, 810, 16))
             self.assertEqual(full_prediction.dtype, np.float32)
@@ -200,6 +204,14 @@ class TestGRUAR(unittest.TestCase):
                 (output_dir / name).unlink(missing_ok=True)
             if output_dir.exists():
                 output_dir.rmdir()
+
+    def test_prediction_output_directory_nomenclature(self):
+        self.assertEqual(
+            prediction_output_directory(
+                Path("evaluation_results"), 102, 90, 720
+            ),
+            Path("evaluation_results") / "seed_102" / "90_810",
+        )
 
     def test_small_synthetic_training_decreases_mae(self):
         torch.manual_seed(7)

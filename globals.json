@@ -157,7 +157,7 @@
   },
   "inference_cdmm_ssm": {
     "num_sequences": 222,
-    "num_samples": 6,
+    "num_samples": 1,
     "long_pred_length": 720,
     "n_plot_examples": 10,
     "seed": 102,

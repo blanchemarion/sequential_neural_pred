@@ -339,6 +339,7 @@ family_order = [
     "temporal_spectral",
     "relational",
     "geometry",
+    "state_dynamics",
 ]
 
 CACHE_SIGNATURE = {
@@ -685,10 +686,7 @@ if RUN_FAMILY_RADAR:
     ]
 
     family_cols = [
-        "family_distribution",
-        "family_temporal_spectral",
-        "family_relational",
-        "family_geometry",
+        f"family_{f}" for f in family_order if df[f"family_{f}"].notna().any()
     ]
 
     family_display_names = {
@@ -696,6 +694,7 @@ if RUN_FAMILY_RADAR:
         "family_temporal_spectral": "Temporal\nSpectral",
         "family_relational": "Relational",
         "family_geometry": "Geometry",
+        "family_state_dynamics": "State\nDynamics",
     }
 
     run_colors = {
@@ -858,14 +857,6 @@ if RUN_FAMILY_BAR:
         "sequifier",
     ]
 
-    plot_cols_requested = [
-        "family_distribution",
-        "family_temporal_spectral",
-        "family_relational",
-        "family_geometry",
-        "FINAL_COMPOSITE_SCORE",
-    ]
-
     df_plot = df.copy()
     mae_values: dict[str, float] = {}
     mae_sem_values: dict[str, float] = {}
@@ -883,6 +874,9 @@ if RUN_FAMILY_BAR:
     df_sem_plot = df_sem.copy()
     df_sem_plot["MAE"] = pd.Series(mae_sem_values)
 
+    plot_cols_requested = [
+        f"family_{f}" for f in family_order if df_plot[f"family_{f}"].notna().any()
+    ] + ["FINAL_COMPOSITE_SCORE"]
     plot_cols = [c for c in plot_cols_requested if c in df_plot.columns]
     if not plot_cols:
         raise ValueError("None of the requested columns were found in df_plot.")

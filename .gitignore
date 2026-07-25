@@ -15,6 +15,8 @@ checkpoints_tf_2/
 checkpoints_1_step/
 evaluation_results/
 checkpoints_VAR_BASELINE_90_90/
+checkpoints_GRU_AR_90_90/
+checkpoints_cDMM_SSM_z*/
 checkpoints_mix_tf_ar/
 checkpoints_TF_KL_0.1/
 checkpoints_TF_QTL_0.1/
@@ -33,3 +35,5 @@ checkpoints_TF_dff/
 hf_release/
 scripts/
 nethobench/
+
+nethobench_slide_figures/

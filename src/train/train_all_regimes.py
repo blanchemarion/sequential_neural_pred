@@ -175,7 +175,6 @@ class CombinedLoss(nn.Module):
         var_weight=0.0,
         kl_weight=0.0,
         qnt_weight=0.0,
-        trj_weight=0.0,
         log_all_terms: bool = True,
         kl_bins: int = 33,
         kl_eps: float = 1e-8,
@@ -221,7 +220,7 @@ class CombinedLoss(nn.Module):
         self.qnt_top_q_regions = qnt_top_q_regions
         self.qnt_eps = qnt_eps
 
-        # mae, shape, deriv, cross, var, kl, qnt, trj
+        # mae, shape, deriv, cross, var, kl, qnt
         self.register_buffer('running_norms', torch.ones(7))
         self.initialized = False
 
@@ -1252,7 +1251,9 @@ def main():
         'max_lr': 0.0003,         # scheduler.max_lr
         'num_epochs': 150, #150 ,     # training_spec.epochs
         'train_ratio': 0.8,
-        'random_seed': 102,      # seed from YAML
+        # Keep the data partition fixed while varying stochastic training runs.
+        'split_seed': 101,
+        'training_seed': 102,
         'save_dir': 'checkpoints',
         'plot_dir': 'evaluation',
         'log_all_loss_terms': True,      # <-- NEW (so mae/shape/deriv/cross/var are computed even if weights=0)
@@ -1303,13 +1304,14 @@ def main():
     print(f"    criterion: {loss_desc}")
     print(f"    early_stopping: {config['early_stop_patience']} epochs")
     print(f"    save_every: {config['save_every']} epochs")
-    print(f"    seed: {config['random_seed']}")
+    print(f"    split_seed: {config['split_seed']}")
+    print(f"    training_seed: {config['training_seed']}")
     
-    # Set random seeds for reproducibility
-    torch.manual_seed(config['random_seed'])
-    np.random.seed(config['random_seed'])
+    # Seed model initialization and all stochastic training operations.
+    torch.manual_seed(config['training_seed'])
+    np.random.seed(config['training_seed'])
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config['random_seed'])
+        torch.cuda.manual_seed_all(config['training_seed'])
     
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1336,13 +1338,13 @@ def main():
     train_examples, val_examples, train_seq_indices, val_seq_indices = split_by_sequences(
         examples, sequence_indices, 
         train_ratio=config['train_ratio'], 
-        random_seed=config['random_seed']
+        random_seed=config['split_seed']
     )
 
 
     run_stem = (
         f"{Path(config['data_path']).stem}"
-        f"_Tin{config['T_in']}_Tout{config['T_out']}_seed{config['random_seed']}"
+        f"_Tin{config['T_in']}_Tout{config['T_out']}_splitseed{config['split_seed']}"
     )
 
     proc_root = Path("data_processed")
@@ -1366,6 +1368,13 @@ def main():
     config["normalization_stats_base"] = str(stats_npy.with_suffix("").resolve())
     config["processed_val_examples_path"] = str(val_npy.resolve())
     config["processed_val_seq_indices_path"] = str(val_seq_npy.resolve())
+
+    # split_by_sequences seeds NumPy internally. Restore the independent training
+    # seed before DataLoader shuffling, model initialization, and scheduled sampling.
+    torch.manual_seed(config['training_seed'])
+    np.random.seed(config['training_seed'])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config['training_seed'])
 
     
     # Free examples array after splitting

@@ -5,7 +5,7 @@ Loads validation tensors saved during training, runs KV-cache rollouts to a fixe
 prediction length per sequence, writes stacked ``.npy`` archives and NeuroBench-style
 CSVs for the forecast window, and saves example overlay SVGs.
 
-Configure ``MODES``, ``SELECTED_CHECKPOINTS``, and ``SEEDS`` below. Run from the
+Configure ``MODES``, ``SELECTED_CHECKPOINTS``, and ``EVALUATION_SEED`` below. Run from the
 repository root so checkpoint and ``data_processed`` paths resolve.
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ from models.model_KV_cached import create_model_cached
 
 NUM_SEQUENCES = 222
 LONG_PRED_LENGTH = 720
-SEEDS = [102]
+EVALUATION_SEED = 101
 
 MODES = ["TF_QTL_0.08_KL_0.02"]
 
@@ -80,13 +80,15 @@ def _resolve_existing_file(path_value: str | None, repo_root: Path) -> Path | No
 
 def _build_processed_paths_from_cfg(cfg: dict, repo_root: Path) -> tuple[Path | None, Path | None]:
     """
-    Rebuild default processed val paths using train_all_regimes run_stem convention:
-      {data_stem}_Tin{T_in}_Tout{T_out}_seed{random_seed}
+    Rebuild default processed val paths using train_all_regimes run_stem convention.
+    New checkpoints use split_seed; random_seed remains supported for old ones.
     """
     try:
         data_stem = Path(cfg["data_path"]).stem
+        split_seed_value = cfg["split_seed"] if "split_seed" in cfg else cfg["random_seed"]
+        split_seed = int(split_seed_value)
         run_stem = (
-            f"{data_stem}_Tin{int(cfg['T_in'])}_Tout{int(cfg['T_out'])}_seed{int(cfg['random_seed'])}"
+            f"{data_stem}_Tin{int(cfg['T_in'])}_Tout{int(cfg['T_out'])}_splitseed{split_seed}"
         )
     except Exception:
         return None, None
@@ -94,6 +96,17 @@ def _build_processed_paths_from_cfg(cfg: dict, repo_root: Path) -> tuple[Path | 
     proc_root = repo_root / "data_processed"
     val_p = proc_root / f"processed_val_{run_stem}.npy"
     seq_p = proc_root / f"processed_val_seq_indices_{run_stem}.npy"
+    if not val_p.is_file() or not seq_p.is_file():
+        # Backward-compatible path for checkpoints made before split_seed existed.
+        try:
+            old_stem = (
+                f"{data_stem}_Tin{int(cfg['T_in'])}_Tout{int(cfg['T_out'])}"
+                f"_seed{int(cfg['random_seed'])}"
+            )
+            val_p = proc_root / f"processed_val_{old_stem}.npy"
+            seq_p = proc_root / f"processed_val_seq_indices_{old_stem}.npy"
+        except (KeyError, TypeError, ValueError):
+            pass
     return val_p, seq_p
 
 
@@ -474,7 +487,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}")
     print(f"Number of sequences per evaluation: {NUM_SEQUENCES}")
-    print(f"Seeds: {SEEDS}")
+    print(f"Evaluation seed: {EVALUATION_SEED}")
     print(f"Long rollout length (prediction timesteps): {LONG_PRED_LENGTH}")
 
     # ------------------------------------------------------------
@@ -552,6 +565,7 @@ def main():
 
     ckpt = torch.load(first_checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
+    split_seed = int(cfg["split_seed"] if "split_seed" in cfg else cfg["random_seed"])
 
     repo_root = Path(__file__).resolve().parents[2]
     val_p = _resolve_existing_file(cfg.get("processed_val_examples_path"), repo_root)
@@ -581,7 +595,7 @@ def main():
         print(f"PROCESSING CONFIG {pair_idx+1}/{len(checkpoint_pairs)}: {config_name}")
         print("="*80)
 
-        for seed in SEEDS:
+        for seed in [EVALUATION_SEED]:
             print(f"\n{'='*60}")
             print(f"SEED {seed}")
             print(f"{'='*60}")
@@ -596,7 +610,10 @@ def main():
             # Use main_output_dir for all results
             main_output_dir.mkdir(parents=True, exist_ok=True)
 
-            indices_path = main_output_dir / f"selected_indices_N{NUM_SEQUENCES}_seed{seed}.npy"
+            indices_path = main_output_dir / (
+                f"selected_indices_N{NUM_SEQUENCES}"
+                f"_splitseed{split_seed}_evalseed{seed}.npy"
+            )
             if indices_path.exists():
                 selected_indices = np.load(indices_path)
                 print(f"  Loaded indices: {indices_path}")
@@ -643,7 +660,7 @@ def main():
                     config_name,
                 )
 
-                if seed == SEEDS[0]:
+                if seed == EVALUATION_SEED:
                     long_pred = np.load(output_dir / f"long_predictions_{config_name}_{mode}.npy")
                     long_gt = np.load(output_dir / f"long_ground_truth_{config_name}.npy")
                     plot_prediction_examples(

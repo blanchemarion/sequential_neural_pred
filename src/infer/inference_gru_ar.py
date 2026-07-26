@@ -171,7 +171,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("checkpoints_GRU_AR_90_90") / "best_model.pt",
+        default=Path("checkpoints_GRU_AR_90_90_seed102") / "best_model.pt",
     )
     parser.add_argument(
         "--num-sequences", type=int, default=int(defaults.get("num_sequences", 200))
@@ -181,7 +181,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--seed",
         dest="evaluation_seed",
         type=int,
-        default=int(defaults.get("evaluation_seed", defaults.get("seed", 101))),
+        default=int(defaults.get("evaluation_seed", defaults.get("seed", 102))),
         help="Fixed seed for evaluation-row sampling",
     )
     parser.add_argument(

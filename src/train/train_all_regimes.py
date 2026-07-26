@@ -1230,9 +1230,9 @@ def main():
 
     # Configuration (matching netho-hp-search-9-run-2.yaml)
     config = {
-        'data_path': 'data_processed/data2p_A_3_1189451_S10_F_dff_10Hz.npy', #'data_processed/data100_ba16.npy',
-        'T_in': 30, #90,
-        'T_out': 30, #90,
+        'data_path': 'data_processed/data100_ba16.npy',
+        'T_in': 90, #90,
+        'T_out': 90, #90,
         'n_vars': 16,
         'd_model': 64,           # model_spec.d_model
         'n_heads': 8,            # model_spec.nhead
@@ -1254,7 +1254,7 @@ def main():
         'max_lr': 0.0003,         # scheduler.max_lr
         'num_epochs': 150, #150 ,     # training_spec.epochs
         'train_ratio': 0.8,
-        'random_seed': 101,      # seed from YAML
+        'random_seed': 102,      # seed from YAML
         'save_dir': 'checkpoints',
         'plot_dir': 'evaluation',
         'log_all_loss_terms': True,      # <-- NEW (so mae/shape/deriv/cross/var are computed even if weights=0)

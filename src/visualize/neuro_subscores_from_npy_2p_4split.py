@@ -45,8 +45,14 @@ from nethobench.analysis.score_definitions import NEURO_FAMILY_METRICS
 # ---------------------------------------------------------------------------
 # Paths and toggles (aligned with neuro_subscores_from_npy_2p.ipynb cell 1)
 # ---------------------------------------------------------------------------
-sub_data_dir = "90_240"
+"""sub_data_dir = "90_240"
 data_dir = _REPO_ROOT / "evaluation_results" / sub_data_dir / "seed_102"
+outputs_dir = _REPO_ROOT / "output" / "neuro_subscores_from_npy_2p_merged_4split"
+csv_dir = outputs_dir / "organized_csv"
+CONTEXT_STEPS_TO_DROP = 0"""
+
+sub_data_dir = "mlp_2p"
+data_dir = _REPO_ROOT / "evaluation_results" / sub_data_dir
 outputs_dir = _REPO_ROOT / "output" / "neuro_subscores_from_npy_2p_merged_4split"
 csv_dir = outputs_dir / "organized_csv"
 CONTEXT_STEPS_TO_DROP = 0
@@ -858,8 +864,8 @@ if RUN_METRIC_DOTPLOT:
 if RUN_HORIZON_SCORES:
     USE_HORIZON_CACHE = True
     FORCE_RECOMPUTE_HORIZON = False
-    SCORED_HORIZONS = [30, 120, 240]
-    HORIZON_START_BY_GT = {"bench": 0, "sequifier": 0}
+    SCORED_HORIZONS = [60, 120, 240]
+    HORIZON_START_BY_GT = {"bench": 90, "sequifier": 0}
 
     preferred_model_order = list(model_files.keys())
 

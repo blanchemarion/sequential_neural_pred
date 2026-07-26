@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 *.pyo
 
+.agents/
+
 # === Local data & checkpoints ===
 data_processed/
 data_raw/
@@ -10,24 +12,15 @@ logs/
 checkpoints/
 configs/
 predictions/
-checkpoints_ar_kv_2/
-checkpoints_tf_2/
-checkpoints_1_step/
+checkpoints_AR_KV_*/
+checkpoints_TF_*/
+checkpoints_1_step_*/
 evaluation_results/
-checkpoints_VAR_BASELINE_90_90/
-checkpoints_GRU_AR_90_90/
+checkpoints_VAR_BASELINE_90_90_*/
+checkpoints_GRU_AR_90_90_*/
 checkpoints_cDMM_SSM_z*/
-checkpoints_mix_tf_ar/
-checkpoints_TF_KL_0.1/
-checkpoints_TF_QTL_0.1/
-checkpoints_TF_QTL_0.08_KL_0.02/
-checkpoints_TF_QTL_0.08_KL_0.02_MOM_0.03/
-checkpoints_TF_QTL_0.08_KL_0.02_TRJ_0.03/
-checkpoints_TF_scaling/
-checkpoints_TF_mix_scaling/
-checkpoints_1_step_scaling/
-checkpoints_AR_scaling/
-checkpoints_MLP_2P/
+checkpoints_TF_QTL_0.08_KL_0.02_*/
+checkpoints_MLP_2P_*/
 output/
 checkpoints_AR_KV/
 checkpoints_TF/

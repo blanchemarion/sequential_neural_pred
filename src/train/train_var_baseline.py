@@ -124,7 +124,7 @@ def main():
         "learning_rate": 1e-3,
         "weight_decay": 1e-5,
         "train_ratio": 0.8,
-        "random_seed": 101,
+        "random_seed": 103, #102, #101,
         "save_dir": "checkpoints_VAR_BASELINE_90_90",
         "early_stop_patience": 25,
         "early_stop_min_delta": 1e-6,

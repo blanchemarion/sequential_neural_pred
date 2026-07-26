@@ -87,7 +87,7 @@ def generate_long_outputs(
         num_samples=num_samples,
         generator=generator,
         seed=seed,
-        sample_emission = True
+        sample_emission = False
     )
     return mean, samples
 
@@ -159,20 +159,32 @@ def evaluate_long_window(
     if not np.isfinite(means).all() or not np.isfinite(samples).all():
         raise ValueError("cDMM_SSM predictions contain NaN or Inf")
 
+    # Match the prediction contract used by inference_gru_ar.py and
+    # inference_all_regimes.py: the main artifact has axes (N,T,V).  Keep the
+    # leading sample axis only in the explicitly named all-samples archive.
+    predictions = samples[0]
+    if predictions.shape != means.shape:
+        raise ValueError(f"Unexpected primary prediction shape: {predictions.shape}")
+
     config_name = f"{t_in}_{t_in + target_pred_length}"
+    mode = "cDMM_SSM"
     mean_mode = "cDMM_SSM_mean"
     sample_mode = "cDMM_SSM_samples"
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, Path] = {}
+    outputs["prediction_npy"] = output_dir / (
+        f"long_predictions_{config_name}_{mode}.npy"
+    )
     outputs["mean_npy"] = output_dir / (
         f"long_predictions_{config_name}_{mean_mode}.npy"
     )
     outputs["samples_npy"] = output_dir / (
-        f"long_predictions_{config_name}.npy"
+        f"long_predictions_{config_name}_{sample_mode}.npy"
     )
     outputs["ground_truth_npy"] = output_dir / (
         f"long_ground_truth_{config_name}.npy"
     )
+    np.save(outputs["prediction_npy"], predictions)
     np.save(outputs["mean_npy"], means)
     np.save(outputs["samples_npy"], samples)
     np.save(outputs["ground_truth_npy"], ground_truth)
@@ -213,6 +225,8 @@ def evaluate_long_window(
         "dtype": "float32",
         "context_steps_in_full_arrays": int(t_in),
         "forecast_steps": int(target_pred_length),
+        "prediction_axes": ["sequence", "time", "region"],
+        "primary_prediction": sample_labels[0] if sample_labels else None,
         "mean_axes": ["sequence", "time", "region"],
         "sample_archive_axes": ["sample", "sequence", "time", "region"],
         "per_sample_axes": ["sequence", "time", "region"],
@@ -234,10 +248,10 @@ def evaluate_long_window(
         json.dumps(metadata, indent=2), encoding="utf-8"
     )
     plot_prediction_examples(
-        means,
+        predictions,
         ground_truth,
         output_dir,
-        mode=mean_mode,
+        mode=mode,
         config_name=config_name,
         pred_start=t_in,
         seed=seed,

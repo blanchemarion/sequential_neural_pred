@@ -78,7 +78,7 @@ export PYTHONUNBUFFERED=1
 nvidia-smi
 python -c "import torch; print('torch', torch.__version__); print('torch cuda', torch.version.cuda); print('cuda available', torch.cuda.is_available()); print('device count', torch.cuda.device_count())"
 
-# ---- run steps (relative paths OK because we cd'ed into PROJECT_DIR) ----
+# ---- run steps ----
 echo "[INFO] Running pipeline..."
 time python src/prepare/prepare.py
 time python src/train/train_all_regimes.py

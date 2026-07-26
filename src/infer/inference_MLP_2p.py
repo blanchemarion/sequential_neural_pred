@@ -14,7 +14,7 @@ _SRC_ROOT = Path(__file__).resolve().parent.parent
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
-from models.MLP_2p import MLP2P
+from models.mlp_2p import MLP2P
 
 
 def load_raw_csv_time_major(csv_path: Path) -> np.ndarray:
@@ -283,7 +283,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--rollout_mode",
         type=str,
-        default="autoregressive",
+        default="block_gt_reset",
         choices=["autoregressive", "block", "block_gt_reset", "chunked_gt_reset"],
     )
     p.add_argument("--chunk_len", type=int, default=10, help="Used only with chunked_gt_reset mode.")
@@ -306,14 +306,24 @@ def main() -> None:
     if ckpt_n != n_neurons:
         raise ValueError(f"Neuron count mismatch: checkpoint={ckpt_n}, csv={n_neurons}")
 
+    ckpt_T_in = int(ckpt["T_in"])
+    ckpt_T_out = int(ckpt["T_out"])
+
+    if int(args.T_in) != ckpt_T_in:
+        raise ValueError(
+            f"T_in mismatch: checkpoint={ckpt_T_in}, requested={args.T_in}"
+        )
+
     model = MLP2P(
-        n_neurons=n_neurons,
-        T_in=int(args.T_in),
+        n_neurons=ckpt_n,
+        T_in=ckpt_T_in,
+        T_out=ckpt_T_out,
         d_local=int(ckpt.get("d_local", 64)),
         d_pop=int(ckpt.get("d_pop", 128)),
         dropout=float(ckpt.get("dropout", 0.05)),
         decay_init=float(ckpt.get("decay_init", 0.85)),
     )
+    
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 

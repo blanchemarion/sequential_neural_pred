@@ -584,8 +584,8 @@ def build_loss(config):
             cross_weight=config.get('loss_cross_weight', 0.0),
             var_weight=config.get('loss_var_weight', 0.0),
 
-            kl_weight=config.get('loss_kl_weight', 0.02),
-            qnt_weight=config.get('loss_qnt_weight', 0.08),
+            kl_weight=config.get('loss_kl_weight', 0.0),
+            qnt_weight=config.get('loss_qnt_weight', 0.0),
 
             log_all_terms=config.get('log_all_loss_terms', True),
 
@@ -1388,10 +1388,10 @@ def main():
     
     # Train both modes sequentially
     training_variants = [
-        {'tag': 'AR_KV', 'label': 'KV Autoregressive'},
         #{'tag': 'MIX_TF_AR_KV', 'label': 'Mixed Teacher Forcing and Autoregressive'},
         #{'tag': 'AR', 'label': 'Autoregressive'},
-        #{'tag': 'TF', 'label': 'Teacher Forcing'},
+        {'tag': 'TF', 'label': 'Teacher Forcing'},
+        {'tag': 'AR_KV', 'label': 'KV Autoregressive'},
     ]
 
     

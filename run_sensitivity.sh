@@ -77,7 +77,7 @@ export PYTHONUNBUFFERED=1
 
 python -c "import torch; print(torch.cuda.is_available()); print(torch.version.cuda)"
 
-# ---- run steps (relative paths OK because we cd'ed into PROJECT_DIR) ----
+# ---- run steps ----
 echo "[INFO] Running pipeline..."
 time python src/prepare/prepare_sensitivity.py
 time python src/prepare/generate_configs.py

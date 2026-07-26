@@ -11,10 +11,31 @@ that mean (ddof=1, n=4) when at least two finite split values exist.
 
 Defaults read tensors from ``evaluation_results/90_810/seed_102`` and write plots
 and caches under ``output/neuro_subscores_from_npy_merged_4split/`` at the repo root.
+
+Examples
+--------
+Score all available sequences through the main four-split analysis::
+
+    python src/visualize/neuro_subscores_from_npy_with_sequifier_4split.py
+
+Score a reproducible random subset of 20 sequences through four splits::
+
+    python src/visualize/neuro_subscores_from_npy_with_sequifier_4split.py \
+        --num-sequences 20 --sequence-selection-seed 102
+
+Optionally add a separate Nethobench evaluation for every selected sequence::
+
+    python src/visualize/neuro_subscores_from_npy_with_sequifier_4split.py \
+        --score-individual-sequences
+
+Individual-sequence scoring is disabled by default because the main analysis is
+the joint Nethobench evaluation of all selected sequences divided into four
+sequence-axis splits.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import tempfile
@@ -35,19 +56,90 @@ import pandas as pd
 
 import nethobench
 from nethobench import compute_neuro_scores
+from nethobench.neuro.metrics.composites import calculate_neuro_composites
+from neuro_scoring_windows import (
+    align_forecast_only,
+    horizon_window_for_prediction,
+    scoring_start_for_prediction,
+)
 
 # ---------------------------------------------------------------------------
 # Paths and toggles
 # ---------------------------------------------------------------------------
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute four-split Nethobench scores, with optional independent "
+            "scoring of each selected prediction sequence."
+        )
+    )
+    parser.add_argument(
+        "--num-sequences",
+        type=int,
+        default=None,
+        help=(
+            "Number of sequences to include from each model in the main "
+            "four-split analysis. By default all available sequences are "
+            "included. A subset is sampled without replacement and then "
+            "sorted by its original sequence index. Because four aggregate "
+            "splits are retained, the minimum is 8."
+        ),
+    )
+    parser.add_argument(
+        "--sequence-selection-seed",
+        type=int,
+        default=102,
+        help="Random seed used by --num-sequences (default: 102).",
+    )
+    parser.add_argument(
+        "--score-individual-sequences",
+        "--score-single-sequences",
+        action="store_true",
+        help=(
+            "Additionally score every selected sequence independently and "
+            "write per-sequence JSON/CSV files. Disabled by default."
+        ),
+    )
+    args = parser.parse_args()
+    if args.num_sequences is not None and args.num_sequences <= 0:
+        parser.error("--num-sequences must be a positive integer")
+    return args
+
+
+ARGS = _parse_args()
+
 sub_data_dir = "90_810"  # "90_1170"
 data_dir = _REPO_ROOT / "evaluation_results" / sub_data_dir / "seed_102"
 outputs_dir = _REPO_ROOT / "output" / "neuro_subscores_from_npy_merged_4split"
 csv_dir = outputs_dir / "organized_csv"
-CONTEXT_STEPS_TO_DROP = 0
+FULL_SEQUENCE_LENGTH = 810
+CONTEXT_STEPS_TO_DROP = 90
 
 N_SPLITS = 4
+MIN_SEQUENCES_PER_SPLIT = 2
 
-cache_path = outputs_dir / f"scores_cache_{sub_data_dir}_4split.json"
+minimum_selected_sequences = N_SPLITS * MIN_SEQUENCES_PER_SPLIT
+if (
+    ARGS.num_sequences is not None
+    and ARGS.num_sequences < minimum_selected_sequences
+):
+    raise ValueError(
+        f"--num-sequences must be at least {minimum_selected_sequences}: "
+        f"Nethobench requires {MIN_SEQUENCES_PER_SPLIT} sequences in each of "
+        f"the {N_SPLITS} splits; got {ARGS.num_sequences}."
+    )
+
+selection_suffix = (
+    ""
+    if ARGS.num_sequences is None
+    else f"_n{ARGS.num_sequences}_seed{ARGS.sequence_selection_seed}"
+)
+result_tag = f"{sub_data_dir}_4split{selection_suffix}"
+cache_path = outputs_dir / f"scores_cache_{result_tag}.json"
+per_sequence_json_path = outputs_dir / f"per_sequence_scores_{result_tag}.json"
+per_sequence_csv_path = outputs_dir / f"per_sequence_scores_{result_tag}.csv"
 outputs_dir.mkdir(parents=True, exist_ok=True)
 csv_dir.mkdir(parents=True, exist_ok=True)
 
@@ -67,6 +159,8 @@ gt_path_sequifier = data_dir / "long_ground_truth_sequifier_last100.npy"
 
 model_files = {
     "VAR": data_dir / "long_predictions_90_810_VAR_BASELINE.npy",
+    "SSM": data_dir / "long_predictions_90_810_cDMM_SSM.npy",
+    "RNN": data_dir / "long_predictions_90_810_GRU_AR.npy",
     "1_step": data_dir / "long_predictions_90_810_1_step.npy",
     "AR": data_dir / "long_predictions_90_810_AR_KV.npy",
     "TF": data_dir / "long_predictions_90_810_TF.npy",
@@ -76,6 +170,8 @@ model_files = {
 
 MODEL_TO_GT = {
     "1_step": "bench",
+    "SSM": "bench",
+    "RNN": "bench",
     "VAR": "bench",
     "AR": "bench",
     "TF": "bench",
@@ -98,18 +194,8 @@ if missing:
 gt_full_bench = _load_gt(gt_path_bench)
 gt_full_seq = _load_gt(gt_path_sequifier)
 
-if CONTEXT_STEPS_TO_DROP < 0:
-    raise ValueError("CONTEXT_STEPS_TO_DROP must be >= 0")
-
-for label, arr in [("bench", gt_full_bench), ("sequifier", gt_full_seq)]:
-    if CONTEXT_STEPS_TO_DROP >= arr.shape[1]:
-        raise ValueError(
-            f"{label}: CONTEXT_STEPS_TO_DROP={CONTEXT_STEPS_TO_DROP} >= n_time={arr.shape[1]}"
-        )
-
-gt_bench = gt_full_bench[:, CONTEXT_STEPS_TO_DROP:, :]
+gt_bench = gt_full_bench
 gt_sequifier = gt_full_seq
-gt = gt_bench
 
 
 def _gt_for_model(model_name: str) -> np.ndarray:
@@ -130,9 +216,35 @@ region_names = [f"R{i}" for i in range(n_reg_b)]
 # ---------------------------------------------------------------------------
 # Dimensionless MAE (same convention as notebook)
 # ---------------------------------------------------------------------------
-MAE_PRED_START = 90
+# Arrays returned by _aligned_gt_pred_for_model are already forecast-only.
+MAE_PRED_START = 0
 _eps_mae_scale = 1e-8
 MAE_SCALE_MODE = "std"
+
+
+def _scoring_start_for_prediction(pred_arr: np.ndarray) -> int:
+    """Return the source-array index at which forecast scoring begins."""
+    return scoring_start_for_prediction(
+        pred_arr,
+        full_sequence_length=FULL_SEQUENCE_LENGTH,
+        context_steps=CONTEXT_STEPS_TO_DROP,
+    )
+
+
+def _selected_sequence_indices(n_sequences: int) -> np.ndarray:
+    """Return sorted original indices for the requested reproducible subset."""
+    n_requested = ARGS.num_sequences
+    if n_requested is None:
+        return np.arange(n_sequences, dtype=int)
+    if n_requested > n_sequences:
+        raise ValueError(
+            f"--num-sequences={n_requested} exceeds the {n_sequences} "
+            "available aligned sequences."
+        )
+    rng = np.random.default_rng(ARGS.sequence_selection_seed)
+    return np.sort(
+        rng.choice(n_sequences, size=n_requested, replace=False).astype(int)
+    )
 
 
 def _aligned_gt_pred_for_model(model_name: str, pred_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -141,13 +253,17 @@ def _aligned_gt_pred_for_model(model_name: str, pred_arr: np.ndarray) -> tuple[n
     if pred_arr.ndim != 3:
         raise ValueError(f"{model_name}: expected 3D prediction array, got {pred_arr.shape}")
 
-    n_seq = min(gt_arr.shape[0], pred_arr.shape[0])
-    n_t = min(gt_arr.shape[1], pred_arr.shape[1])
-    n_reg = min(gt_arr.shape[2], pred_arr.shape[2])
-
-    gt_al = gt_arr[:n_seq, :n_t, :n_reg].astype(np.float64, copy=False)
-    pred_al = pred_arr[:n_seq, :n_t, :n_reg].astype(np.float64, copy=False)
-    return gt_al, pred_al
+    gt_al, pred_al = align_forecast_only(
+        gt_arr,
+        pred_arr,
+        full_sequence_length=FULL_SEQUENCE_LENGTH,
+        context_steps=CONTEXT_STEPS_TO_DROP,
+    )
+    selected = _selected_sequence_indices(gt_al.shape[0])
+    return (
+        gt_al[selected].astype(np.float64, copy=False),
+        pred_al[selected].astype(np.float64, copy=False),
+    )
 
 
 def _scale_from_gt_forecast(gt_f: np.ndarray, mode: str = MAE_SCALE_MODE, eps: float = _eps_mae_scale) -> float:
@@ -216,10 +332,10 @@ def _mae_mean_sem_over_sequence_splits(model_name: str, pred_path: Path) -> tupl
 
 print("Ground truth (benchmark):")
 print("  path:", gt_path_bench)
-print("  scored shape:", gt_bench.shape)
+print("  raw shape:", gt_bench.shape)
 print("Ground truth (sequifier):")
 print("  path:", gt_path_sequifier)
-print("  scored shape:", gt_sequifier.shape)
+print("  raw shape:", gt_sequifier.shape)
 pred_shapes: dict[str, tuple[int, ...]] = {}
 for model_name, pred_path in model_files.items():
     pred = np.load(pred_path, allow_pickle=False)
@@ -236,6 +352,27 @@ for model_name, pred_path in model_files.items():
 print("Prediction shapes:")
 for k, v in pred_shapes.items():
     print(f"  {k}: {v}")
+
+selected_sequence_indices_by_model: dict[str, list[int]] = {}
+for model_name, shape in pred_shapes.items():
+    gt_ref = _gt_for_model(model_name)
+    n_aligned = min(int(shape[0]), int(gt_ref.shape[0]))
+    selected_sequence_indices_by_model[model_name] = (
+        _selected_sequence_indices(n_aligned).tolist()
+    )
+
+selection_description = (
+    "all available sequences"
+    if ARGS.num_sequences is None
+    else (
+        f"{ARGS.num_sequences} sequences sampled without replacement "
+        f"(seed={ARGS.sequence_selection_seed})"
+    )
+)
+print("Sequence selection:", selection_description)
+for model_name, indices in selected_sequence_indices_by_model.items():
+    preview = indices if len(indices) <= 20 else [*indices[:10], "...", *indices[-3:]]
+    print(f"  {model_name}: n={len(indices)}, original indices={preview}")
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +434,36 @@ def _scores_for_arrays(gt_slice: np.ndarray, pred_slice: np.ndarray) -> dict[str
     return {k: (float(v) if v is not None else float("nan")) for k, v in scores.items()}
 
 
+def _scores_for_single_sequence(
+    gt_sequence: np.ndarray, pred_sequence: np.ndarray
+) -> dict[str, float]:
+    """
+    Score one sequence with Nethobench's existing composite implementation.
+
+    ``compute_neuro_scores`` delegates to this evaluator after CSV loading, but
+    its loader intentionally rejects tensors with fewer than two sequences.
+    Calling the same evaluator on a one-sequence tensor preserves the metric
+    logic while bypassing only that batch-size validation.
+    """
+    gt_sequence = np.asarray(gt_sequence, dtype=np.float64)
+    pred_sequence = np.asarray(pred_sequence, dtype=np.float64)
+    if gt_sequence.ndim != 3 or pred_sequence.ndim != 3:
+        raise ValueError(
+            "Individual scoring expects 3D [1,time,region] arrays, got "
+            f"{gt_sequence.shape} and {pred_sequence.shape}."
+        )
+    if gt_sequence.shape != pred_sequence.shape or gt_sequence.shape[0] != 1:
+        raise ValueError(
+            "Individual scoring requires matching [1,time,region] tensors, got "
+            f"{gt_sequence.shape} and {pred_sequence.shape}."
+        )
+    scores = calculate_neuro_composites(gt_sequence, pred_sequence)
+    return {
+        key: (float(value) if value is not None else float("nan"))
+        for key, value in scores.items()
+    }
+
+
 def _nansem_across_values(a: np.ndarray) -> float:
     a = np.asarray(a, dtype=float).reshape(-1)
     a = a[np.isfinite(a)]
@@ -306,14 +473,19 @@ def _nansem_across_values(a: np.ndarray) -> float:
 
 
 def _sequence_split_indices(n_seq: int, n_splits: int) -> list[np.ndarray]:
-    if n_seq < n_splits:
+    minimum = n_splits * MIN_SEQUENCES_PER_SPLIT
+    if n_seq < minimum:
         raise ValueError(
-            f"Need at least {n_splits} sequences for an {n_splits}-way split along "
-            f"the sequence axis, got n_seq={n_seq}."
+            f"Need at least {minimum} sequences for an {n_splits}-way split "
+            f"with at least {MIN_SEQUENCES_PER_SPLIT} sequences per split; "
+            f"got n_seq={n_seq}."
         )
     parts = np.array_split(np.arange(n_seq), n_splits)
-    if any(p.size == 0 for p in parts):
-        raise ValueError(f"array_split produced an empty chunk for n_seq={n_seq}, n_splits={n_splits}")
+    if any(p.size < MIN_SEQUENCES_PER_SPLIT for p in parts):
+        raise ValueError(
+            "array_split produced a chunk below Nethobench's two-sequence "
+            f"minimum for n_seq={n_seq}, n_splits={n_splits}."
+        )
     return list(parts)
 
 
@@ -328,6 +500,103 @@ def _aggregate_split_score_dicts(split_dicts: list[dict[str, float]]) -> tuple[d
         mean_d[k] = float(np.nanmean(arr))
         sem_d[k] = _nansem_across_values(arr)
     return mean_d, sem_d
+
+
+def _categorized_scores(scores: dict[str, float]) -> dict[str, dict[str, float]]:
+    """Group every returned score into family, subfamily, or composite fields."""
+    composite_keys = {
+        "composite_score",
+        "FINAL_COMPOSITE_SCORE",
+        "FINAL_NEURO_COMPOSITE_SCORE",
+    }
+    return {
+        "family_scores": {
+            key: float(value)
+            for key, value in scores.items()
+            if key.startswith("family_")
+        },
+        "subfamily_scores": {
+            key: float(value)
+            for key, value in scores.items()
+            if not key.startswith("family_") and key not in composite_keys
+        },
+        "composite_scores": {
+            key: float(value)
+            for key, value in scores.items()
+            if key in composite_keys
+        },
+    }
+
+
+def _write_per_sequence_outputs(
+    per_model_scores: dict[str, list[dict]],
+) -> None:
+    """Write nested JSON and one-row-per-model-sequence wide CSV outputs."""
+    payload = {
+        "_metadata": {
+            "kind": "individual_sequence_neuro_scores",
+            "sub_data_dir": sub_data_dir,
+            "n_splits": N_SPLITS,
+            "num_sequences_requested": ARGS.num_sequences,
+            "sequence_selection_seed": ARGS.sequence_selection_seed,
+            "selected_sequence_indices_by_model": selected_sequence_indices_by_model,
+            "forecast_scoring_rule": {
+                "full_sequence_length": FULL_SEQUENCE_LENGTH,
+                "context_steps_dropped": CONTEXT_STEPS_TO_DROP,
+            },
+            "note": (
+                "Each row is an independent Nethobench evaluation of one "
+                "selected sequence. sequence_index is its index in the original "
+                "prediction and ground-truth arrays."
+            ),
+        },
+        "models": per_model_scores,
+    }
+    per_sequence_json_path.write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+
+    flat_rows: list[dict] = []
+    for model_name, records in per_model_scores.items():
+        for record in records:
+            row = {
+                "model": model_name,
+                "sequence_index": int(record["sequence_index"]),
+                "selected_position": int(record["selected_position"]),
+                "split": int(record["split"]),
+                "n_timesteps": int(record["n_timesteps"]),
+                "n_regions": int(record["n_regions"]),
+            }
+            for category in (
+                "family_scores",
+                "subfamily_scores",
+                "composite_scores",
+            ):
+                row.update(record.get(category, {}))
+            flat_rows.append(row)
+
+    per_sequence_df = pd.DataFrame(flat_rows)
+    if not per_sequence_df.empty:
+        metadata_cols = [
+            "model",
+            "sequence_index",
+            "selected_position",
+            "split",
+            "n_timesteps",
+            "n_regions",
+        ]
+        score_cols = sorted(
+            column for column in per_sequence_df.columns if column not in metadata_cols
+        )
+        per_sequence_df = per_sequence_df[metadata_cols + score_cols]
+    per_sequence_df.to_csv(
+        per_sequence_csv_path,
+        index=False,
+        float_format="%.10g",
+    )
+    print("Saved individual-sequence JSON to", per_sequence_json_path)
+    print("Saved individual-sequence CSV to", per_sequence_csv_path)
 
 
 # ---------------------------------------------------------------------------
@@ -347,37 +616,95 @@ CACHE_SIGNATURE = {
     "n_splits": N_SPLITS,
     "models": list(model_files.keys()),
     "sub_data_dir": sub_data_dir,
+    "sequence_selection": {
+        "num_sequences_requested": ARGS.num_sequences,
+        "seed": ARGS.sequence_selection_seed,
+        "selected_sequence_indices_by_model": selected_sequence_indices_by_model,
+    },
+    "forecast_scoring_rule": {
+        "full_sequence_length": FULL_SEQUENCE_LENGTH,
+        "context_steps_dropped": CONTEXT_STEPS_TO_DROP,
+    },
 }
+
+
+def _main_cache_signature_matches(signature: object) -> bool:
+    """Accept current and compatible legacy four-split cache signatures."""
+
+    if not isinstance(signature, dict):
+        return False
+    normalized = dict(signature)
+    if normalized.get("kind") in {
+        "neuro_scores_4split_sequence_axis",
+        "neuro_scores_4split_sequence_axis_with_individual_sequences",
+    }:
+        normalized["kind"] = CACHE_SIGNATURE["kind"]
+    if (
+        "sequence_selection" not in normalized
+        and ARGS.num_sequences is None
+    ):
+        normalized["sequence_selection"] = CACHE_SIGNATURE[
+            "sequence_selection"
+        ]
+    return normalized == CACHE_SIGNATURE
+
 
 all_scores: dict[str, dict[str, float]] = {}
 all_scores_sem: dict[str, dict[str, float]] = {}
 per_model_split_scores: dict[str, list[dict[str, float]]] = {}
+per_model_sequence_scores: dict[str, list[dict]] = {}
+
+
+def _write_four_split_cache() -> None:
+    payload = {
+        "_cache_signature": CACHE_SIGNATURE,
+        "means": all_scores,
+        "sem": all_scores_sem,
+        "per_split": per_model_split_scores,
+        # Optional and ignored by the main four-split cache validity check.
+        "per_sequence": per_model_sequence_scores,
+    }
+    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print("Saved cache to", cache_path)
+
 
 if USE_CACHE and cache_path.exists():
     print("Loading cached 4-split results from", cache_path)
     loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-    if isinstance(loaded, dict) and loaded.get("_cache_signature") == CACHE_SIGNATURE:
+    if isinstance(loaded, dict) and _main_cache_signature_matches(
+        loaded.get("_cache_signature")
+    ):
         all_scores = {k: {kk: float(vv) for kk, vv in v.items()} for k, v in loaded["means"].items()}
         all_scores_sem = {k: {kk: float(vv) for kk, vv in v.items()} for k, v in loaded["sem"].items()}
         per_model_split_scores = loaded["per_split"]
+        per_model_sequence_scores = loaded.get("per_sequence", {})
     else:
         print("Cache signature mismatch; recomputing 4-split scores.")
 
-if RUN_SCORES and (not all_scores or not USE_CACHE):
+if RUN_SCORES and (
+    not all_scores or not per_model_split_scores or not USE_CACHE
+):
+    all_scores = {}
+    all_scores_sem = {}
+    per_model_split_scores = {}
     for model_name, pred_path in model_files.items():
         print(f"\nComputing {N_SPLITS}-split neuro scores for: {model_name}")
         pred = np.load(pred_path, allow_pickle=False)
-        gt_model = _gt_for_model(model_name)
         gt_al, pred_al = _aligned_gt_pred_for_model(model_name, pred)
+        score_start = _scoring_start_for_prediction(pred)
+        print(
+            f"  scoring source timesteps {score_start}:"
+            f"{score_start + gt_al.shape[1]} ({gt_al.shape[1]} steps)"
+        )
 
-        organized_model_dir = csv_dir / model_name
+        organized_model_dir = csv_dir / f"{model_name}{selection_suffix}"
         out_gt_csv = organized_model_dir / "gt.csv"
         out_pred_csv = organized_model_dir / "pred.csv"
 
         if SAVE_ORGANIZED_CSV:
             write_neurobench_csv_from_arrays(
-                gt_arr=gt_model,
-                pred_arr=pred,
+                gt_arr=gt_al,
+                pred_arr=pred_al,
                 region_names=region_names,
                 out_gt_csv=out_gt_csv,
                 out_pred_csv=out_pred_csv,
@@ -387,7 +714,14 @@ if RUN_SCORES and (not all_scores or not USE_CACHE):
         split_indices = _sequence_split_indices(gt_al.shape[0], N_SPLITS)
         split_dicts: list[dict[str, float]] = []
         for si, idx in enumerate(split_indices):
-            print(f"  split {si + 1}/{N_SPLITS}: sequences {int(idx[0])}..{int(idx[-1])} (n={idx.size})")
+            original_idx = np.asarray(
+                selected_sequence_indices_by_model[model_name], dtype=int
+            )[idx]
+            print(
+                f"  split {si + 1}/{N_SPLITS}: selected positions "
+                f"{int(idx[0])}..{int(idx[-1])} (n={idx.size}; "
+                f"original indices {int(original_idx[0])}..{int(original_idx[-1])})"
+            )
             split_dicts.append(_scores_for_arrays(gt_al[idx], pred_al[idx]))
 
         mean_d, sem_d = _aggregate_split_score_dicts(split_dicts)
@@ -395,14 +729,80 @@ if RUN_SCORES and (not all_scores or not USE_CACHE):
         all_scores_sem[model_name] = sem_d
         per_model_split_scores[model_name] = split_dicts
 
-    payload = {
-        "_cache_signature": CACHE_SIGNATURE,
-        "means": all_scores,
-        "sem": all_scores_sem,
-        "per_split": per_model_split_scores,
-    }
-    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print("Saved cache to", cache_path)
+    _write_four_split_cache()
+
+if ARGS.score_individual_sequences:
+    individual_scores_complete = (
+        set(per_model_sequence_scores) == set(model_files)
+        and all(
+            len(per_model_sequence_scores.get(model_name, []))
+            == len(selected_sequence_indices_by_model[model_name])
+            for model_name in model_files
+        )
+    )
+    if not individual_scores_complete or not USE_CACHE:
+        if not USE_CACHE:
+            per_model_sequence_scores = {}
+        for model_name, pred_path in model_files.items():
+            expected_count = len(
+                selected_sequence_indices_by_model[model_name]
+            )
+            if (
+                USE_CACHE
+                and len(per_model_sequence_scores.get(model_name, []))
+                == expected_count
+            ):
+                print(
+                    f"\nReusing {expected_count} cached individual scores "
+                    f"for: {model_name}"
+                )
+                continue
+            print(f"\nComputing individual-sequence scores for: {model_name}")
+            pred = np.load(pred_path, allow_pickle=False)
+            gt_al, pred_al = _aligned_gt_pred_for_model(model_name, pred)
+            split_indices = _sequence_split_indices(gt_al.shape[0], N_SPLITS)
+            split_for_position = {
+                int(position): int(split_number)
+                for split_number, idx in enumerate(split_indices, start=1)
+                for position in idx
+            }
+            original_indices = selected_sequence_indices_by_model[model_name]
+            sequence_records: list[dict] = []
+            for selected_position, sequence_index in enumerate(original_indices):
+                sequence_score = _scores_for_single_sequence(
+                    gt_al[selected_position : selected_position + 1],
+                    pred_al[selected_position : selected_position + 1],
+                )
+                sequence_records.append(
+                    {
+                        "sequence_index": int(sequence_index),
+                        "selected_position": int(selected_position),
+                        "split": split_for_position[selected_position],
+                        "n_timesteps": int(gt_al.shape[1]),
+                        "n_regions": int(gt_al.shape[2]),
+                        **_categorized_scores(sequence_score),
+                    }
+                )
+                completed = selected_position + 1
+                if (
+                    completed == 1
+                    or completed % 10 == 0
+                    or completed == len(original_indices)
+                ):
+                    print(
+                        "  individual sequences: "
+                        f"{completed}/{len(original_indices)}"
+                    )
+            per_model_sequence_scores[model_name] = sequence_records
+            # Individual scoring is expensive, so checkpoint completed models.
+            _write_per_sequence_outputs(per_model_sequence_scores)
+            _write_four_split_cache()
+    _write_per_sequence_outputs(per_model_sequence_scores)
+else:
+    print(
+        "Individual-sequence scoring disabled "
+        "(enable with --score-individual-sequences)."
+    )
 
 # ---------------------------------------------------------------------------
 # Family / composite table
@@ -459,6 +859,8 @@ for model_name, scores in all_scores.items():
 # ---------------------------------------------------------------------------
 model_order = [
     "VAR",
+    "SSM",
+    "RNN",
     "1_step",
     "AR",
     "TF",
@@ -489,9 +891,9 @@ submetrics_sem_wide_df = pd.DataFrame(
 )
 submetrics_sem_wide_df.index.name = "submetric"
 
-tsv_path = outputs_dir / f"submetrics_comparison_{sub_data_dir}_4split.tsv"
-csv_path = outputs_dir / f"submetrics_comparison_{sub_data_dir}_4split.csv"
-sem_tsv_path = outputs_dir / f"submetrics_comparison_{sub_data_dir}_4split_sem.tsv"
+tsv_path = outputs_dir / f"submetrics_comparison_{result_tag}.tsv"
+csv_path = outputs_dir / f"submetrics_comparison_{result_tag}.csv"
+sem_tsv_path = outputs_dir / f"submetrics_comparison_{result_tag}_sem.tsv"
 
 submetrics_wide_df.to_csv(tsv_path, sep="\t", float_format="%.6f")
 submetrics_wide_df.to_csv(csv_path, float_format="%.6f")
@@ -517,6 +919,8 @@ if RUN_EXAMPLE_OVERLAY_PLOT:
         "AR",
         "1_step",
         "VAR",
+        "SSM",
+        "RNN",
     ]
 
     MODEL_TO_EXAMPLE_SEQ = {
@@ -526,6 +930,8 @@ if RUN_EXAMPLE_OVERLAY_PLOT:
         "TF": 56,
         "TF_QL_0.08_KL_0.02": 56,
         "sequifier": 56,
+        "SSM": 56,
+        "RNN": 56,
     }
 
     example_gt_paths = {
@@ -536,6 +942,8 @@ if RUN_EXAMPLE_OVERLAY_PLOT:
     MODEL_TO_EXAMPLE_GT = {
         "1_step": "bench",
         "VAR": "bench",
+        "SSM": "bench",
+        "RNN": "bench",
         "AR": "bench",
         "TF": "bench",
         "TF_QL_0.08_KL_0.02": "bench",
@@ -549,11 +957,15 @@ if RUN_EXAMPLE_OVERLAY_PLOT:
         "AR": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_AR_KV.npy",
         "1_step": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_1_step.npy",
         "VAR": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_VAR_BASELINE.npy",
+        "SSM": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_cDMM_SSM.npy",
+        "RNN": data_dir / f"long_predictions_{EXAMPLE_SUBDIR}_GRU_AR.npy",
     }
 
     run_colors_ex = {
         "VAR": "#3E7CB1",
         "1_step": "#7A7A7A",
+        "SSM": "#D95F02",
+        "RNN": "#E6AB02",
         "AR": "#2AA876",
         "TF": "#A23B72",
         "TF_QL_0.08_KL_0.02": "#6A4C93",
@@ -679,6 +1091,8 @@ if RUN_FAMILY_RADAR:
     models_to_plot_radar = [
         "VAR",
         "1_step",
+        "SSM",
+        "RNN",
         "AR",
         "TF",
         "TF_QL_0.08_KL_0.02",
@@ -704,6 +1118,8 @@ if RUN_FAMILY_RADAR:
         "TF": "#A23B72",
         "TF_QL_0.08_KL_0.02": "#6A4C93",
         "sequifier": "#C46410",
+        "SSM": "#D95F02",
+        "RNN": "#E6AB02",
     }
 
     model_aliases = {
@@ -713,6 +1129,8 @@ if RUN_FAMILY_RADAR:
         "VAR": ["VAR", "VAR_BASELINE"],
         "sequifier": ["sequifier"],
         "TF_QL_0.08_KL_0.02": ["TF_QL_0.08_KL_0.02"],
+        "SSM": ["SSM"],
+        "RNN": ["RNN"],
     }
 
     resolved_models: list[str] = []
@@ -836,7 +1254,7 @@ if RUN_FAMILY_RADAR:
         columnspacing=1.5,
     )
     plt.tight_layout()
-    out_radar = outputs_dir / f"radar_family_scores_{sub_data_dir}_4split_{'norm' if NORMALIZE_FAMILIES else 'raw'}.svg"
+    out_radar = outputs_dir / f"radar_family_scores_{result_tag}_{'norm' if NORMALIZE_FAMILIES else 'raw'}.svg"
     fig.savefig(out_radar, format="svg", bbox_inches="tight")
     print(f"Radar chart saved to: {out_radar}")
     plt.close(fig)
@@ -851,6 +1269,8 @@ if RUN_FAMILY_BAR:
     models_to_plot_bar = [
         "VAR",
         "1_step",
+        "SSM",
+        "RNN",
         "AR",
         "TF",
         "TF_QL_0.08_KL_0.02",
@@ -921,6 +1341,8 @@ if RUN_FAMILY_BAR:
         "TF": "#A23B72",
         "TF_QL_0.08_KL_0.02": "#6A4C93",
         "sequifier": "#C46410",
+        "SSM": "#D95F02",
+        "RNN": "#E6AB02",
     }
 
     n_families = len(plot_cols)
@@ -976,7 +1398,7 @@ if RUN_FAMILY_BAR:
     ax_b.set_ylim(ymin_b, ymax_b)
     ax_b.legend(frameon=False, title="Model", fontsize=9)
     plt.tight_layout()
-    bar_plot_path = outputs_dir / f"bar_family_scores_{sub_data_dir}_4split_{'norm' if normalize else 'raw'}.svg"
+    bar_plot_path = outputs_dir / f"bar_family_scores_{result_tag}_{'norm' if normalize else 'raw'}.svg"
     fig_b.savefig(bar_plot_path, format="svg", bbox_inches="tight")
     print(f"Bar chart saved to: {bar_plot_path}")
     plt.close(fig_b)
@@ -988,7 +1410,6 @@ if RUN_HORIZON_SCORES:
     USE_HORIZON_CACHE = True
     FORCE_RECOMPUTE_HORIZON = False
     SCORED_HORIZONS = [90, 360, 720]
-    HORIZON_START_BY_GT = {"bench": 0, "sequifier": 0}
 
     preferred_model_order = [
         "1_step",
@@ -997,10 +1418,15 @@ if RUN_HORIZON_SCORES:
         "AR",
         "VAR",
         "sequifier",
+        "SSM",
+        "RNN",
     ]
 
     _horiz_tag = "_".join(str(h) for h in SCORED_HORIZONS)
-    horizon_cache_path = outputs_dir / f"scores_cache_{sub_data_dir}_h{_horiz_tag}_4split_composite_only.json"
+    horizon_cache_path = outputs_dir / (
+        f"scores_cache_{sub_data_dir}_h{_horiz_tag}_4split"
+        f"{selection_suffix}_composite_only.json"
+    )
 
     def _align_gt_pred(gt_a: np.ndarray, pred_a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         n_seq = min(gt_a.shape[0], pred_a.shape[0])
@@ -1008,11 +1434,15 @@ if RUN_HORIZON_SCORES:
         n_reg = min(gt_a.shape[2], pred_a.shape[2])
         return gt_a[:n_seq, :n_t, :n_reg], pred_a[:n_seq, :n_t, :n_reg]
 
-    def _horizon_window_for_model(model_name: str, H: int) -> tuple[int, int]:
-        gt_key = MODEL_TO_GT.get(model_name, "bench")
-        start = int(HORIZON_START_BY_GT.get(gt_key, 0))
-        end = start + int(H)
-        return start, end
+    def _horizon_window_for_prediction(
+        pred_arr: np.ndarray, H: int
+    ) -> tuple[int, int]:
+        return horizon_window_for_prediction(
+            pred_arr,
+            H,
+            full_sequence_length=FULL_SEQUENCE_LENGTH,
+            context_steps=CONTEXT_STEPS_TO_DROP,
+        )
 
     horizon_defs = [(f"{H}", int(H)) for H in SCORED_HORIZONS]
 
@@ -1020,8 +1450,16 @@ if RUN_HORIZON_SCORES:
         "kind": "horizon_composite_4split",
         "horizons": [int(h) for h in SCORED_HORIZONS],
         "models": list(preferred_model_order),
-        "horizon_start_by_gt": dict(HORIZON_START_BY_GT),
+        "forecast_scoring_rule": {
+            "full_sequence_length": FULL_SEQUENCE_LENGTH,
+            "context_steps_dropped": CONTEXT_STEPS_TO_DROP,
+        },
         "n_splits": N_SPLITS,
+        "sequence_selection": {
+            "num_sequences_requested": ARGS.num_sequences,
+            "seed": ARGS.sequence_selection_seed,
+            "selected_sequence_indices_by_model": selected_sequence_indices_by_model,
+        },
     }
 
     horizon_scores_nested: dict[str, dict[str, dict]] = {}
@@ -1041,9 +1479,16 @@ if RUN_HORIZON_SCORES:
         if model_name not in horizon_scores_nested:
             horizon_scores_nested[model_name] = {}
 
-        start_max, end_max = _horizon_window_for_model(model_name, max(SCORED_HORIZONS))
+        start_max, end_max = _horizon_window_for_prediction(
+            pred, max(SCORED_HORIZONS)
+        )
         gt_ref = _gt_for_model(model_name)
         g, p = _align_gt_pred(gt_ref, pred)
+        selected = np.asarray(
+            selected_sequence_indices_by_model[model_name], dtype=int
+        )
+        g = g[selected]
+        p = p[selected]
         if g.shape[1] < end_max or p.shape[1] < end_max:
             raise ValueError(
                 f"{model_name}: need at least {end_max} timesteps, got gt={g.shape[1]}, pred={p.shape[1]}"
@@ -1056,7 +1501,7 @@ if RUN_HORIZON_SCORES:
                 print(f"Skipping {model_name} @ H={H} (cached)")
                 continue
 
-            start_t, end_t = _horizon_window_for_model(model_name, H)
+            start_t, end_t = _horizon_window_for_prediction(pred, H)
             gt_h = g[:, start_t:end_t, :]
             pred_h = p[:, start_t:end_t, :]
 
@@ -1114,6 +1559,8 @@ if RUN_HORIZON_SCORES:
 
     run_colors_h = {
         "1_step": "#7A7A7A",
+        "SSM": "#D95F02",
+        "RNN": "#E6AB02",
         "TF": "#A23B72",
         "TF_QL_0.08_KL_0.02": "#6A4C93",
         "AR": "#2AA876",
@@ -1149,7 +1596,10 @@ if RUN_HORIZON_SCORES:
 
     ax_nb.legend(frameon=False, fontsize=9, loc="best")
     fig_nb.tight_layout()
-    nb_plot_path = outputs_dir / f"horizon_nethobench_{sub_data_dir}_{_horiz_tag}_4split_sem.svg"
+    nb_plot_path = outputs_dir / (
+        f"horizon_nethobench_{sub_data_dir}_{_horiz_tag}_4split"
+        f"{selection_suffix}_sem.svg"
+    )
     fig_nb.savefig(nb_plot_path, format="svg", bbox_inches="tight")
     print(f"Saved Nethobench horizon SVG to: {nb_plot_path}")
     plt.close(fig_nb)

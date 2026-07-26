@@ -1253,7 +1253,7 @@ def main():
         'train_ratio': 0.8,
         # Keep the data partition fixed while varying stochastic training runs.
         'split_seed': 101,
-        'training_seed': 103,
+        'training_seed': 102,
         'save_dir': 'checkpoints',
         'plot_dir': 'evaluation',
         'log_all_loss_terms': True,      

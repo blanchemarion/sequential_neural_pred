@@ -478,7 +478,7 @@ def main():
     SELECTED_CHECKPOINTS = [
         {
             "config_name": "90_810",
-            "TF": "checkpoints_TF_seed102",
+            "TF": "checkpoints_TF_seed103",
         }
     ]
 

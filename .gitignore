@@ -30,3 +30,10 @@ scripts/
 nethobench/
 
 nethobench_slide_figures/
+
+
+data-clean-90-split0.parquet
+sequifier-netho-seq-sl90-ba16-data100-seed101-last-100-predictions.csv
+sequifier-netho-seq-sl90-ba16-data100-seed102-last-100-predictions.csv
+sequifier-netho-seq-sl90-ba16-data100-seed103-last-100-predictions.csv
+

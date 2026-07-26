@@ -60,6 +60,8 @@ def build_config(args: argparse.Namespace) -> dict:
         raise ValueError("globals.json is missing the train_gru_ar configuration")
 
     config = dict(section)
+    config.setdefault("split_seed", int(config.get("random_seed", 101)))
+    config.setdefault("training_seed", int(config.get("random_seed", 101)))
     data_path = (
         args.data_path.resolve()
         if args.data_path is not None
@@ -156,14 +158,14 @@ def prepare_data(config: dict, num_workers: int):
         examples,
         sequence_indices,
         train_ratio=float(config["train_ratio"]),
-        random_seed=int(config["random_seed"]),
+        random_seed=int(config["split_seed"]),
     )
     del examples, sequence_indices
 
     data_stem = Path(config["data_path"]).stem
     run_stem = (
         f"{data_stem}_Tin{config['T_in']}_Tout{config['T_out']}"
-        f"_seed{config['random_seed']}_gru_ar"
+        f"_splitseed{config['split_seed']}_gru_ar"
     )
     processed_root = Path(config["data_path"]).parent
     stats_path = processed_root / f"train_norm_stats_{run_stem}.npy"
@@ -322,7 +324,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[INFO] Windows: overriding num_workers {workers} -> 0")
         workers = 0
 
-    set_deterministic_seed(int(config["random_seed"]))
+    set_deterministic_seed(int(config["training_seed"]))
     save_dir = Path(config["save_dir"])
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -332,8 +334,12 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Device: {device}")
     print(f"Data: {config['data_path']}")
     print(f"Checkpoints: {save_dir}")
+    print(f"Split seed: {config['split_seed']}")
+    print(f"Training seed: {config['training_seed']}")
 
     train_loader, val_loader = prepare_data(config, workers)
+    # split_by_sequences resets NumPy's RNG; restore independent training state.
+    set_deterministic_seed(int(config["training_seed"]))
     model = create_gru_ar(
         n_vars=int(config["n_vars"]),
         hidden_dim=int(config["hidden_dim"]),

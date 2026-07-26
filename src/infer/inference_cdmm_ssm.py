@@ -280,7 +280,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--num-samples", type=int, default=int(defaults.get("num_samples", 6))
     )
-    parser.add_argument("--seed", type=int, default=int(defaults.get("seed", 102)))
+    parser.add_argument(
+        "--evaluation-seed",
+        "--seed",
+        dest="evaluation_seed",
+        type=int,
+        default=int(defaults.get("evaluation_seed", defaults.get("seed", 101))),
+        help="Fixed seed for evaluation-row sampling and stochastic rollout samples",
+    )
     parser.add_argument(
         "--long-pred-length",
         type=int,
@@ -336,7 +343,8 @@ def main(argv: list[str] | None = None) -> None:
     if val_sequence_indices.shape != (val_examples.shape[0],):
         raise ValueError("Validation sequence metadata does not match examples")
 
-    seed = int(args.seed)
+    seed = int(args.evaluation_seed)
+    split_seed = int(config.get("split_seed", config.get("random_seed", 101)))
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
@@ -348,7 +356,9 @@ def main(argv: list[str] | None = None) -> None:
         output_root, seed, t_in, int(args.long_pred_length)
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    index_path = output_dir.parent / f"selected_indices_N{count}_seed{seed}.npy"
+    index_path = output_dir.parent / (
+        f"selected_indices_N{count}_splitseed{split_seed}_evalseed{seed}.npy"
+    )
     if index_path.exists():
         selected_indices = np.load(index_path).astype(np.int64, copy=False)
     else:
@@ -362,6 +372,8 @@ def main(argv: list[str] | None = None) -> None:
     print("=" * 80)
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Latent dimension: {config['latent_dim']}")
+    print(f"Split seed: {split_seed}")
+    print(f"Evaluation seed: {seed}")
     print(f"Samples per context: {args.num_samples}")
     print(f"Output: {output_dir}")
     evaluate_long_window(

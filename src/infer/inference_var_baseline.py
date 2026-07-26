@@ -294,7 +294,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("checkpoints_VAR_BASELINE_90_90") / "final_model.pt",
+        default=Path("checkpoints_VAR_BASELINE_90_90_seed103") / "final_model.pt",
         help="Path to baseline checkpoint from train_var_baseline.py",
     )
     parser.add_argument(
@@ -304,15 +304,17 @@ def parse_args(argv: list[str] | None = None):
         help="Number of validation rows to evaluate",
     )
     parser.add_argument(
+        "--evaluation-seed",
         "--seed",
+        dest="evaluation_seed",
         type=int,
         default=102,
-        help="Random seed for sampled evaluation indices",
+        help="Fixed seed for sampled evaluation indices",
     )
     parser.add_argument(
         "--long-pred-length",
         type=int,
-        default=90,
+        default=720,
         help="Forecast horizon length (after T_in context)",
     )
     parser.add_argument(
@@ -361,17 +363,24 @@ def main(argv: list[str] | None = None):
     if val_seq_indices.ndim != 1 or val_seq_indices.shape[0] != val_examples.shape[0]:
         raise ValueError("val_seq_indices is incompatible with val_examples")
 
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
+    evaluation_seed = int(args.evaluation_seed)
+    split_seed = int(cfg.get("split_seed", cfg.get("random_seed", 101)))
+    print(f"Split seed: {split_seed}")
+    print(f"Evaluation seed: {evaluation_seed}")
+    np.random.seed(evaluation_seed)
+    torch.manual_seed(evaluation_seed)
+    random.seed(evaluation_seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(evaluation_seed)
 
     n_val = len(val_examples)
     n_pick = min(args.num_sequences, n_val)
-    output_dir = args.output_root / config_name / f"seed_{args.seed}"
+    output_dir = args.output_root / config_name / f"seed_{evaluation_seed}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    idx_path = output_dir.parent / f"selected_indices_N{n_pick}_seed{args.seed}.npy"
+    idx_path = output_dir.parent / (
+        f"selected_indices_N{n_pick}_splitseed{split_seed}"
+        f"_evalseed{evaluation_seed}.npy"
+    )
 
     if idx_path.exists():
         selected_indices = np.load(idx_path).astype(np.int64, copy=False)
@@ -391,7 +400,7 @@ def main(argv: list[str] | None = None):
         t_out=t_out,
         target_pred_length=args.long_pred_length,
         device=device,
-        seed=args.seed,
+        seed=evaluation_seed,
         config_name=config_name,
         mode=mode,
         n_plot_examples=args.n_plot_examples,

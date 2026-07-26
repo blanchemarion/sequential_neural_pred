@@ -1253,11 +1253,11 @@ def main():
         'train_ratio': 0.8,
         # Keep the data partition fixed while varying stochastic training runs.
         'split_seed': 101,
-        'training_seed': 102,
+        'training_seed': 103,
         'save_dir': 'checkpoints',
         'plot_dir': 'evaluation',
-        'log_all_loss_terms': True,      # <-- NEW (so mae/shape/deriv/cross/var are computed even if weights=0)
-        'checkpoint_first_epoch': 5,     # <-- NEW
+        'log_all_loss_terms': True,      
+        'checkpoint_first_epoch': 5,     
         'checkpoint_every': 25, 
         'save_every': 15,       # training_spec.iter_save
         'early_stop_patience': 150, #15,  # training_spec.early_stopping_epochs
@@ -1398,7 +1398,7 @@ def main():
         #{'tag': 'MIX_TF_AR_KV', 'label': 'Mixed Teacher Forcing and Autoregressive'},
         #{'tag': 'AR', 'label': 'Autoregressive'},
         {'tag': 'TF', 'label': 'Teacher Forcing'},
-        {'tag': 'AR_KV', 'label': 'KV Autoregressive'},
+        #{'tag': 'AR_KV', 'label': 'KV Autoregressive'},
     ]
 
     

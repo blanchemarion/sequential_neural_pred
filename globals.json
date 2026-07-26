@@ -94,7 +94,8 @@
     "max_lr": 0.0003,
     "num_epochs": 150,
     "train_ratio": 0.8,
-    "random_seed": 101,
+    "split_seed": 101,
+    "training_seed": 101,
     "save_dir": "checkpoints_GRU_AR_90_90",
     "checkpoint_first_epoch": 5,
     "checkpoint_every": 25,
@@ -110,7 +111,7 @@
     "num_sequences": 222,
     "long_pred_length": 720,
     "n_plot_examples": 10,
-    "seed": 102,
+    "evaluation_seed": 101,
     "output_root": "evaluation_results"
   },
   "train_cdmm_ssm": {
@@ -143,7 +144,8 @@
     "max_lr": 0.0003,
     "num_epochs": 150,
     "train_ratio": 0.8,
-    "random_seed": 101,
+    "split_seed": 101,
+    "training_seed": 101,
     "save_dir": "checkpoints_cDMM_SSM_z8_90_90",
     "checkpoint_first_epoch": 5,
     "checkpoint_every": 25,
@@ -160,7 +162,7 @@
     "num_samples": 1,
     "long_pred_length": 720,
     "n_plot_examples": 10,
-    "seed": 102,
+    "evaluation_seed": 101,
     "output_root": "evaluation_results"
   },
   "generate_configs": {

@@ -29,7 +29,7 @@ from models.model_KV_cached import create_model_cached
 
 NUM_SEQUENCES = 222
 LONG_PRED_LENGTH = 720
-EVALUATION_SEED = 101
+EVALUATION_SEED = 102
 
 MODES = ["TF_QTL_0.08_KL_0.02"]
 

@@ -54,8 +54,10 @@ def build_config(args: argparse.Namespace) -> dict:
     if not isinstance(section, dict):
         raise ValueError("globals.json is missing train_cdmm_ssm")
     config = dict(section)
+    config.setdefault("split_seed", int(config.get("random_seed", 101)))
+    config.setdefault("training_seed", int(config.get("random_seed", 101)))
     config.setdefault("validation_num_samples", 16)
-    config.setdefault("validation_seed", int(config["random_seed"]))
+    config.setdefault("validation_seed", int(config["training_seed"]))
     config["decoder_hidden_dims"] = list(config["decoder_hidden_dims"])
     config["supported_latent_dims"] = list(config["supported_latent_dims"])
 
@@ -174,13 +176,13 @@ def prepare_data(config: dict, num_workers: int):
         examples,
         sequence_indices,
         train_ratio=float(config["train_ratio"]),
-        random_seed=int(config["random_seed"]),
+        random_seed=int(config["split_seed"]),
     )
     del examples, sequence_indices
 
     run_stem = (
         f"{Path(config['data_path']).stem}_Tin{config['T_in']}_Tout{config['T_out']}"
-        f"_seed{config['random_seed']}_cdmm_z{config['latent_dim']}"
+        f"_splitseed{config['split_seed']}_cdmm_z{config['latent_dim']}"
     )
     processed_root = Path(config["data_path"]).parent
     stats_path = processed_root / f"train_norm_stats_{run_stem}.npy"
@@ -439,7 +441,7 @@ def main(argv: list[str] | None = None) -> None:
     if os.name == "nt" and workers > 0:
         print(f"[INFO] Windows: overriding num_workers {workers} -> 0")
         workers = 0
-    set_seed(int(config["random_seed"]))
+    set_seed(int(config["training_seed"]))
     save_dir = Path(config["save_dir"])
     save_dir.mkdir(parents=True, exist_ok=True)
     
@@ -458,7 +460,11 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Latent dimension: {config['latent_dim']}")
     print(f"Data: {config['data_path']}")
     print(f"Checkpoints: {save_dir}")
+    print(f"Split seed: {config['split_seed']}")
+    print(f"Training seed: {config['training_seed']}")
     train_loader, val_loader = prepare_data(config, workers)
+    # split_by_sequences resets NumPy's RNG; restore independent training state.
+    set_seed(int(config["training_seed"]))
     model = create_model_from_config(config, device)
     config["parameter_count"] = model.count_parameters()
     print(f"Parameters: {model.count_parameters():,}")
@@ -623,4 +629,3 @@ if __name__ == "__main__":
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-

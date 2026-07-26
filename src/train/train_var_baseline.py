@@ -124,7 +124,8 @@ def main():
         "learning_rate": 1e-3,
         "weight_decay": 1e-5,
         "train_ratio": 0.8,
-        "random_seed": 103, #102, #101,
+        "split_seed": 101,
+        "training_seed": 103,  # vary across 101, 102, 103
         "save_dir": "checkpoints_VAR_BASELINE_90_90",
         "early_stop_patience": 25,
         "early_stop_min_delta": 1e-6,
@@ -142,16 +143,18 @@ def main():
         )
         effective_num_workers = 0
 
-    torch.manual_seed(config["random_seed"])
-    np.random.seed(config["random_seed"])
+    torch.manual_seed(config["training_seed"])
+    np.random.seed(config["training_seed"])
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config["random_seed"])
+        torch.cuda.manual_seed_all(config["training_seed"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     save_dir = Path(config["save_dir"])
     save_dir.mkdir(parents=True, exist_ok=True)
     print(f"Using device: {device}")
     print(f"Saving to: {save_dir}")
+    print(f"Split seed: {config['split_seed']}")
+    print(f"Training seed: {config['training_seed']}")
 
     print("\nPreparing data...")
     data_array = load_data(config["data_path"])
@@ -169,13 +172,13 @@ def main():
         examples,
         sequence_indices,
         train_ratio=config["train_ratio"],
-        random_seed=config["random_seed"],
+        random_seed=config["split_seed"],
     )
     del examples, sequence_indices
 
     run_stem = (
         f"{Path(config['data_path']).stem}"
-        f"_Tin{config['T_in']}_Tout{config['T_out']}_seed{config['random_seed']}_var"
+        f"_Tin{config['T_in']}_Tout{config['T_out']}_splitseed{config['split_seed']}_var"
     )
     proc_root = Path("data_processed")
     proc_root.mkdir(parents=True, exist_ok=True)
@@ -196,6 +199,12 @@ def main():
     config["normalization_stats_base"] = str(stats_npy.with_suffix("").resolve())
     config["processed_val_examples_path"] = str(val_npy.resolve())
     config["processed_val_seq_indices_path"] = str(val_seq_npy.resolve())
+
+    # split_by_sequences resets NumPy's RNG; restore independent training state.
+    torch.manual_seed(config["training_seed"])
+    np.random.seed(config["training_seed"])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config["training_seed"])
 
     train_loader, val_loader = create_dataloaders(
         train_examples,

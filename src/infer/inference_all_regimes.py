@@ -478,7 +478,7 @@ def main():
     SELECTED_CHECKPOINTS = [
         {
             "config_name": "90_810",
-            "TF_QTL_0.08_KL_0.02": "checkpoints_TF_QTL_0.08_KL_0.02_seed103",
+            "TF_QTL_0.08_KL_0.02": "checkpoints_TF_QTL_0.08_KL_0.02_seed102",
         }
     ]
 

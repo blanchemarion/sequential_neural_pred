@@ -222,7 +222,7 @@ class CombinedLoss(nn.Module):
         self.qnt_eps = qnt_eps
 
         # mae, shape, deriv, cross, var, kl, qnt, trj
-        self.register_buffer('running_norms', torch.ones(8))
+        self.register_buffer('running_norms', torch.ones(7))
         self.initialized = False
 
     def _soft_histogram_probs(self, x, lo, hi, bins, eps):
@@ -459,7 +459,6 @@ class CombinedLoss(nn.Module):
         var_raw   = torch.zeros((), device=device, dtype=dtype)
         kl_raw    = torch.zeros((), device=device, dtype=dtype)
         qnt_raw   = torch.zeros((), device=device, dtype=dtype)
-        trj_raw   = torch.zeros((), device=device, dtype=dtype)
 
         kl_mean_raw = torch.zeros((), device=device, dtype=dtype)
         kl_q10_raw = torch.zeros((), device=device, dtype=dtype)
@@ -525,7 +524,6 @@ class CombinedLoss(nn.Module):
             self.running_norms[4] = (var_raw.detach()   + 1e-8) if need_var   else torch.tensor(1.0, device=device)
             self.running_norms[5] = (kl_raw.detach()    + 1e-8) if need_kl    else torch.tensor(1.0, device=device)
             self.running_norms[6] = (qnt_raw.detach()   + 1e-8) if need_qnt   else torch.tensor(1.0, device=device)
-            self.running_norms[7] = (trj_raw.detach()   + 1e-8) if need_trj   else torch.tensor(1.0, device=device)
             self.initialized = True
 
         total = self.weights['mae'] * (mae_raw / self.running_norms[0])

@@ -581,8 +581,8 @@ def build_loss(config):
             cross_weight=config.get('loss_cross_weight', 0.0),
             var_weight=config.get('loss_var_weight', 0.0),
 
-            kl_weight=config.get('loss_kl_weight', 0.02),
-            qnt_weight=config.get('loss_qnt_weight', 0.08),
+            kl_weight=config.get('loss_kl_weight', 0.0),
+            qnt_weight=config.get('loss_qnt_weight', 0.0),
 
             log_all_terms=config.get('log_all_loss_terms', True),
 
@@ -1229,7 +1229,7 @@ def main():
     config = {
         'data_path': 'data_processed/data100_ba16.npy',
         'T_in': 90, #90,
-        'T_out': 90, #90,
+        'T_out': 1, #90,
         'n_vars': 16,
         'd_model': 64,           # model_spec.d_model
         'n_heads': 8,            # model_spec.nhead

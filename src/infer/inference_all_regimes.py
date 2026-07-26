@@ -31,7 +31,7 @@ NUM_SEQUENCES = 222
 LONG_PRED_LENGTH = 720
 EVALUATION_SEED = 102
 
-MODES = ["TF"] #["TF_QTL_0.08_KL_0.02"]
+MODES = ["TF_QTL_0.08_KL_0.02"]
 
 
 def save_sequences_to_neurobench_csv(arr: np.ndarray, csv_path: str | Path, region_names=None):
@@ -478,7 +478,7 @@ def main():
     SELECTED_CHECKPOINTS = [
         {
             "config_name": "90_810",
-            "TF": "checkpoints_TF_seed103",
+            "TF_QTL_0.08_KL_0.02": "checkpoints_TF_QTL_0.08_KL_0.02_seed103",
         }
     ]
 

@@ -272,7 +272,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("checkpoints_cDMM_SSM_z12_90_90") / "best_model.pt",
+        default=Path("checkpoints_cDMM_SSM_z12_90_90_seed103") / "best_model.pt",
     )
     parser.add_argument(
         "--num-sequences", type=int, default=int(defaults.get("num_sequences", 10))

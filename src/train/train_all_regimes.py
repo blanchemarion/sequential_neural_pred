@@ -1229,7 +1229,7 @@ def main():
     config = {
         'data_path': 'data_processed/data100_ba16.npy',
         'T_in': 90, #90,
-        'T_out': 1, #90,
+        'T_out': 90, #90,
         'n_vars': 16,
         'd_model': 64,           # model_spec.d_model
         'n_heads': 8,            # model_spec.nhead
@@ -1253,7 +1253,7 @@ def main():
         'train_ratio': 0.8,
         # Keep the data partition fixed while varying stochastic training runs.
         'split_seed': 101,
-        'training_seed': 103,
+        'training_seed': 102,
         'save_dir': 'checkpoints',
         'plot_dir': 'evaluation',
         'log_all_loss_terms': True,      
@@ -1397,8 +1397,8 @@ def main():
     training_variants = [
         #{'tag': 'MIX_TF_AR_KV', 'label': 'Mixed Teacher Forcing and Autoregressive'},
         #{'tag': 'AR', 'label': 'Autoregressive'},
-        {'tag': 'TF', 'label': 'Teacher Forcing'},
-        #{'tag': 'AR_KV', 'label': 'KV Autoregressive'},
+        #{'tag': 'TF', 'label': 'Teacher Forcing'},
+        {'tag': 'AR_KV', 'label': 'KV Autoregressive'},
     ]
 
     

@@ -111,7 +111,7 @@
     "num_sequences": 222,
     "long_pred_length": 720,
     "n_plot_examples": 10,
-    "evaluation_seed": 101,
+    "evaluation_seed": 102,
     "output_root": "evaluation_results"
   },
   "train_cdmm_ssm": {
@@ -162,7 +162,7 @@
     "num_samples": 1,
     "long_pred_length": 720,
     "n_plot_examples": 10,
-    "evaluation_seed": 101,
+    "evaluation_seed": 102,
     "output_root": "evaluation_results"
   },
   "generate_configs": {

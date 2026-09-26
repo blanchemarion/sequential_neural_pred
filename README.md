@@ -1,6 +1,6 @@
 # Sequential neural forecasting
 
-Code for forecasting population neural activity from an observed time series. The analyses cover widefield calcium recordings and two photon fluorescence traces. The widefield experiments compare a causal, decoder only Transformer with linear autoregression (VAR), an autoregressive GRU, and a conditional deep Markov state space model (cDMM SSM). A population conditioned MLP provides a separate baseline for two photon traces. The repository also contains long horizon evaluation and neural realism scoring code used in the accompanying article.
+Code for forecasting population neural activity from an observed time series. The analyses cover widefield calcium recordings and two photon fluorescence traces. The widefield experiments compare a causal, decoder only Transformer with linear autoregression (VAR), an autoregressive GRU (RNN), and a conditional deep Markov state space model (SSM). A population conditioned MLP provides a separate baseline for two photon traces. The repository also contains long horizon evaluation and neural realism scoring code used in the accompanying article.
 
 This README describes the analysis code and its inputs. Reported numerical results should be taken from the article and the exact experiment outputs used to prepare its figures.
 
@@ -14,7 +14,7 @@ python -m pip install -r requirements.txt
 python -m pip install -e ./nethobench
 ```
 
-The last command installs the NethoBench package included in this repository; no separate checkout is needed. Large training and scoring runs may require a CUDA GPU and substantial memory.
+The last command installs the Nethob  ench package included in this repository; no separate checkout is needed. Large training and scoring runs may require a CUDA GPU and substantial memory.
 
 ## Reproduce a reported analysis figure
 

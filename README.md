@@ -91,7 +91,7 @@ python src/infer/inference_MLP_2p.py --csv_path /path/to/traces.csv --checkpoint
 
 The trainer defaults to a 90 step context and a 16 step training target. The inference script defaults to a 720 step recursive forecast. Use `--help` to set horizons, split gaps, and other options explicitly for a particular analysis.
 
-## Evaluation for the article
+## Evaluation 
 
 The scripts in `src/visualize/` consume aligned forecast and ground truth arrays. `neuro_scoring_windows.py` defines the shared forecast window logic; score comparisons should use the same sequences and forecast window for every model.
 
@@ -118,7 +118,7 @@ These analyses require the corresponding aligned arrays and, where applicable, N
 
 ## Reproducibility and citation
 
-For each article figure or table, record the source revision, exact `globals.json` snapshot, input data version, model checkpoint, training and evaluation seeds, forecast window, and scoring code version. The repository contains code for several analyses, so a single default run does not reproduce every article panel. Cite the accompanying article using its published bibliographic details when available, and cite this repository revision for the software.
+For each article figure or table, record the source revision, exact `globals.json` snapshot, input data version, model checkpoint, training and evaluation seeds, forecast window, and scoring code version. The repository contains code for several analyses, so a single default run does not reproduce every article panel. 
 
 ## License
 

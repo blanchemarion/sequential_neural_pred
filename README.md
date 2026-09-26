@@ -99,6 +99,7 @@ The scripts in `src/visualize/` consume aligned forecast and ground truth arrays
 - `neuro_metric_specific_visualizations_90_810.py` produces metric level diagnostic figures for the 90 observed plus 720 forecast step setting.
 - `analyze_pointwise_fidelity_vs_nethobench.py` compares direct forecast fidelity with structural neural realism.
 - `estimate_widefield_ceiling_floor.py` estimates reference bounds for widefield scoring.
+- `matched_widefield_references.py` calculates matched widefield references for the 222 evaluation targets over the 720-step forecast window.
 - `neuro_subscores_from_npy_2p_4split.py` and `neuro_subscores_from_npy_2p_4split_filtered_regions.py` evaluate two photon forecasts.
 - `plot_all_configs_learning_curves.py` plots training histories across configurations.
 

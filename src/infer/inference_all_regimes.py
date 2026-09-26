@@ -612,10 +612,10 @@ def main():
                 output_dir, device, EVALUATION_SEED, LONG_PRED_LENGTH, "90_810",
             )
             long_pred = np.load(
-                output_dir / f"long_predictions_90_810_{mode}.npy", mmap_mode="r"
+                output_dir / f"long_predictions_90_810_{mode}.npy"
             )
             long_gt = np.load(
-                output_dir / "long_ground_truth_90_810.npy", mmap_mode="r"
+                output_dir / "long_ground_truth_90_810.npy"
             )
             plot_prediction_examples(
                 long_pred, long_gt, output_dir, f"90_810_{mode}", "long",

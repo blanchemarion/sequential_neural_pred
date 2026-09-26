@@ -116,7 +116,7 @@ These analyses require the corresponding aligned arrays and, where applicable, N
 | `src/helpers/` | Configuration and preprocessing utilities |
 | `nethobench/` | NethoBench scoring package used by the current analysis scripts |
 
-## Reproducibility and citation
+## Reproducibility
 
 For each article figure or table, record the source revision, exact `globals.json` snapshot, input data version, model checkpoint, training and evaluation seeds, forecast window, and scoring code version. The repository contains code for several analyses, so a single default run does not reproduce every article panel. 
 

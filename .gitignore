@@ -8,6 +8,7 @@ __pycache__/
 # === Local data & checkpoints ===
 data_processed/
 data_raw/
+data_release/
 logs/
 checkpoints/
 configs/
@@ -27,13 +28,10 @@ checkpoints_TF/
 checkpoints_TF_dff/
 hf_release/
 scripts/
-nethobench/
-
 nethobench_slide_figures/
-
-
+checkpoint_release_portable/
+checkpoint_release/
 data-clean-90-split0.parquet
 sequifier-netho-seq-sl90-ba16-data100-seed101-last-100-predictions.csv
 sequifier-netho-seq-sl90-ba16-data100-seed102-last-100-predictions.csv
 sequifier-netho-seq-sl90-ba16-data100-seed103-last-100-predictions.csv
-

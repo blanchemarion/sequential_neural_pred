@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-Estimate empirical Nethobench ceilings and shuffle floors for widefield data.
+Estimate an empirical Nethobench ceiling and shuffle floors for neural recordings.
 
-The input is the processed NCT-block array produced by ``src/prepare/prepare.py``:
-``[sequenceID, subsequence, region, time]``. Consecutive subsequences from one
-sequenceID are concatenated before sampling. Each repetition draws two disjoint
-real windows from the same sequenceID. The first window is ground truth, the
-second is the split-half prediction, and three invalid surrogates provide
-matched floors. The fully factorized null draws every scalar independently,
-with replacement, from all real values outside the reference sequenceID.
+For references matched to all 222 original evaluation targets, use
+``matched_widefield_references.py``. This standalone empirical sampler supports
+other pair counts and is not matched to the original target set by default.
+
+Supported inputs are:
+
+- processed widefield NCT-block arrays from ``src/prepare/prepare.py``, with
+  shape ``[sequenceID, subsequence, region, time]``;
+- raw 2p trace CSVs with no header, rows = neurons, columns = timepoints, as
+  documented by ``src/prepare/prepare_2p_traces.py``.
+
+Consecutive subsequences from one sequenceID are concatenated before sampling.
+Each repetition draws two disjoint real windows from the same recording. The
+first window is ground truth, the second is the split-half prediction, and
+temporal-only and time+region shuffles provide two matched floors.
 
 All scores come from Nethobench's existing ``calculate_neuro_composites``
 implementation, which is the in-memory scoring core called by
@@ -16,18 +24,29 @@ implementation, which is the in-memory scoring core called by
 repetition contains one sequence, while the CSV input validator requires at
 least two sequences.
 
-Example (defaults: 720 steps, 200 repetitions, four batches, seed 101):
+Example (defaults: 720 steps, 222 independently sampled pairs, four batches,
+seed 101). This mode matches the model evaluation's count but draws different
+targets. To hold the original 222 evaluation targets fixed across Monte Carlo
+draws, run ``matched_widefield_references.py`` instead. Standalone results are
+saved to ``output/widefield_empirical_ceiling_floor`` by default.
 
     python src/visualize/estimate_widefield_ceiling_floor.py
 
-Choose a non-default floor for model normalization:
-
-    python src/visualize/estimate_widefield_ceiling_floor.py --normalization-floor temporal
-
-Enable the paired ceiling-window variance-contraction dose-response:
+Run the same analysis on the 2p recording:
 
     python src/visualize/estimate_widefield_ceiling_floor.py \
-        --variance-contraction-dose-response
+        --data-path data_raw/2p_traces/Data_Valence_FULL_A_3_1189451_Session_10_C_dec_10Hz.csv
+
+Restrict all sampled windows to one sequenceID and one reproducible RNG seed:
+
+    python src/visualize/estimate_widefield_ceiling_floor.py \
+        --sequence-id 0 --seed 101
+
+The paired ceiling-window variance-contraction dose-response runs by default.
+Disable it when only the ceiling/floor analysis is needed:
+
+    python src/visualize/estimate_widefield_ceiling_floor.py \
+        --no-variance-contraction-dose-response
 
 Override the retained-variance ratios (rho=1 is required for verification):
 
@@ -35,10 +54,11 @@ Override the retained-variance ratios (rho=1 is required for verification):
         --variance-contraction-dose-response \
         --variance-contraction-rhos 1.0 0.5 0.25 0.0
 
-The default input and model-cache paths are:
+The default widefield input and model-cache paths are:
 
     data_processed/data100_ba16.npy
-    output/neuro_subscores_from_npy_merged_4split/scores_cache_90_810_4split.json
+    output/neuro_subscores_from_npy_merged_4split_3seeds_new/
+        scores_cache_90_810_4split_3seeds.json
 """
 
 from __future__ import annotations
@@ -48,25 +68,47 @@ import json
 import math
 import os
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import t as student_t
 
+from cns_plotting import setup_cnsplots_style
+
+
+def setup_plot_style() -> None:
+    """Apply the same cnsplots-based publication defaults as peer figures."""
+
+    setup_cnsplots_style(
+        {
+            "svg.fonttype": "none",
+            "axes.linewidth": 0.8,
+            "figure.dpi": 120,
+            "savefig.dpi": 300,
+        }
+    )
+
+
+setup_plot_style()
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NETHOBENCH_ROOT = REPO_ROOT / "nethobench"
-if (NETHOBENCH_ROOT / "nethobench" / "__init__.py").is_file():
-    nb_path = str(NETHOBENCH_ROOT.resolve())
-    if nb_path not in sys.path:
-        sys.path.insert(0, nb_path)
+if not (NETHOBENCH_ROOT / "nethobench" / "__init__.py").is_file():
+    raise RuntimeError(
+        f"Required nethobench checkout not found: {NETHOBENCH_ROOT}"
+    )
+nb_path = str(NETHOBENCH_ROOT.resolve())
+if nb_path in sys.path:
+    sys.path.remove(nb_path)
+sys.path.insert(0, nb_path)
 
 # Avoid joblib's platform-specific physical-core probe warning; Nethobench's
 # numerical results do not depend on this worker-count hint.
@@ -78,31 +120,31 @@ warnings.filterwarnings(
     module=r"joblib\.externals\.loky\.backend\.context",
 )
 
+import nethobench
 from nethobench.neuro.metrics.composites import calculate_neuro_composites
 from nethobench.neuro.metrics import additional as nethobench_additional_metrics
+
+_RESOLVED_NETHOBENCH_PATH = Path(nethobench.__file__).resolve()
+if NETHOBENCH_ROOT.resolve() not in _RESOLVED_NETHOBENCH_PATH.parents:
+    raise RuntimeError(
+        "Resolved Nethobench outside nethobench: "
+        f"{_RESOLVED_NETHOBENCH_PATH}"
+    )
 
 
 CEILING = "split_half_ceiling"
 TEMPORAL_FLOOR = "temporal_shuffle_floor"
 TIME_REGION_FLOOR = "time_and_region_shuffle_floor"
-FACTORIZED_FLOOR = "fully_factorized_empirical_null_floor"
-CONDITIONS = (
-    CEILING,
-    TEMPORAL_FLOOR,
-    TIME_REGION_FLOOR,
-    FACTORIZED_FLOOR,
-)
+CONDITIONS = (CEILING, TEMPORAL_FLOOR, TIME_REGION_FLOOR)
 CONDITION_LABELS = {
     CEILING: "Split-half ceiling",
     TEMPORAL_FLOOR: "Temporal-shuffle floor",
     TIME_REGION_FLOOR: "Time + region shuffle floor",
-    FACTORIZED_FLOOR: "Fully factorized empirical null",
 }
 CONDITION_COLORS = {
     CEILING: "#3E7CB1",
     TEMPORAL_FLOOR: "#E6AB02",
     TIME_REGION_FLOOR: "#7A7A7A",
-    FACTORIZED_FLOOR: "#B22222",
 }
 
 DEFAULT_VARIANCE_CONTRACTION_RHOS = (1.0, 0.50, 0.32, 0.20, 0.09, 0.06, 0.0)
@@ -128,7 +170,7 @@ PLOT_SCORE_LABELS = {
 MODEL_ORDER = [
     "VAR",
     "1_step",
-    "SMM",
+    "SSM",
     "RNN",
     "AR",
     "TF",
@@ -142,7 +184,7 @@ MODEL_COLORS = {
     "TF": "#A23B72",
     "TF_QL_0.08_KL_0.02": "#6A4C93",
     "sequifier": "#C46410",
-    "SMM": "#D95F02",
+    "SSM": "#D95F02",
     "RNN": "#E6AB02",
 }
 
@@ -156,7 +198,6 @@ SAMPLE_COLUMNS = [
     "ceiling_end_exclusive",
     "temporal_shuffle_seed",
     "time_region_shuffle_seed",
-    "factorized_null_seed",
 ]
 SCORE_META_COLUMNS = SAMPLE_COLUMNS + ["condition"]
 
@@ -179,13 +220,25 @@ class EligibleSession:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Estimate empirical widefield Nethobench ceiling and shuffle floors."
+        description=(
+            "Estimate an empirical Nethobench ceiling and shuffle floors for "
+            "processed widefield arrays or raw 2p trace CSVs."
+        )
     )
     parser.add_argument(
         "--data-path",
         type=Path,
-        default=REPO_ROOT / "data_processed" / "data100_ba16.npy",
-        help="Processed [sequence, subsequence, region, time] NumPy array.",
+        default=REPO_ROOT /"data_processed" / "data100_ba16.npy", # / "data_raw" / "2p_traces" / "Data_Valence_FULL_A_3_1189451_Session_10_F_dff_10Hz.csv", #
+        help=(
+            "Processed [sequence, subsequence, region, time] NumPy array, or a "
+            "headerless 2p CSV with rows=neurons and columns=timepoints."
+        ),
+    )
+    parser.add_argument(
+        "--input-format",
+        choices=("auto", "widefield-npy", "2p-csv"),
+        default="auto",
+        help="Input layout. 'auto' infers it from the .npy or .csv suffix.",
     )
     parser.add_argument(
         "--model-cache",
@@ -193,19 +246,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=(
             REPO_ROOT
             / "output"
-            / "neuro_subscores_from_npy_merged_4split"
-            / "scores_cache_90_810_4split.json"
+            / "neuro_subscores_from_npy_merged_4split_3seeds_new"
+            / "scores_cache_90_810_4split_3seeds.json"
         ),
-        help="Four-split Nethobench model-score cache.",
+        help=(
+            "Four-split Nethobench model-score cache. Three-training-seed "
+            "caches are averaged across training seeds within each split."
+        ),
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "output" / "widefield_empirical_ceiling_floor",
-        help="Directory for CSV, JSON, and plot outputs.",
+        default=None,
+        help=(
+            "Directory for CSV, JSON, and plot outputs. Defaults to the legacy "
+            "widefield directory for .npy input and a recording-specific 2p "
+            "directory for .csv input."
+        ),
     )
     parser.add_argument("--window-length", type=int, default=720)
-    parser.add_argument("--repetitions", type=int, default=200)
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=222,
+        help="Number of real-window pairs (default: 222, matching model evaluation).",
+    )
+    parser.add_argument(
+        "--sequence-id",
+        type=int,
+        default=None,
+        help=(
+            "Restrict every sampled ceiling/floor window to this zero-based "
+            "sequenceID. By default, repetitions sample across all eligible "
+            "sequences."
+        ),
+    )
     parser.add_argument(
         "--batches",
         type=int,
@@ -216,14 +291,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--expected-regions",
         type=int,
-        default=16,
-        help="Fail if the processed array does not have this many regions.",
-    )
-    parser.add_argument(
-        "--normalization-floor",
-        choices=("fully-factorized", "time-and-region", "temporal"),
-        default="fully-factorized",
-        help="Floor used in (model-floor)/(ceiling-floor).",
+        default=None,
+        help=(
+            "Fail unless this many regions/neurons are present. By default, "
+            "widefield .npy input expects 16 and 2p CSV input accepts any count."
+        ),
     )
     parser.add_argument(
         "--clip-normalized",
@@ -233,7 +305,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--skip-model-normalization",
         action="store_true",
-        help="Compute empirical references only; do not load or plot model scores.",
+        help=(
+            "Compute empirical references only; do not load or plot model "
+            "scores. This is already the default for 2p CSV input."
+        ),
+    )
+    parser.add_argument(
+        "--normalize-model-scores",
+        action="store_true",
+        help=(
+            "Opt in to model-cache normalization for 2p CSV input. Use only "
+            "with a model cache whose scores are scientifically comparable to "
+            "this 2p recording. Widefield .npy input keeps its legacy default "
+            "of normalizing unless --skip-model-normalization is set."
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -248,10 +333,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--variance-contraction-dose-response",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Enable the paired ceiling-window retained-variance dose-response "
-            "without changing the existing ceiling/floor analyses."
+            "Run the paired ceiling-window retained-variance dose-response "
+            "(enabled by default). Use --no-variance-contraction-dose-response "
+            "to skip it."
         ),
     )
     parser.add_argument(
@@ -282,12 +369,21 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--window-length must be positive")
     if args.repetitions <= 0:
         raise ValueError("--repetitions must be positive")
+    if args.sequence_id is not None and args.sequence_id < 0:
+        raise ValueError("--sequence-id must be a non-negative integer")
     if args.batches <= 0:
         raise ValueError("--batches must be positive")
     if args.batches > args.repetitions:
         raise ValueError("--batches cannot exceed --repetitions")
     if args.checkpoint_every <= 0:
         raise ValueError("--checkpoint-every must be positive")
+    if args.expected_regions is not None and args.expected_regions <= 0:
+        raise ValueError("--expected-regions must be positive when provided")
+    if args.skip_model_normalization and args.normalize_model_scores:
+        raise ValueError(
+            "--skip-model-normalization and --normalize-model-scores are "
+            "mutually exclusive"
+        )
     rhos = np.asarray(args.variance_contraction_rhos, dtype=float)
     if rhos.ndim != 1 or rhos.size == 0 or not np.isfinite(rhos).all():
         raise ValueError("--variance-contraction-rhos must contain finite values")
@@ -304,6 +400,111 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--variance-contraction-bootstrap-count must be positive"
         )
+
+
+def _resolve_input_format(data_path: Path, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    suffix = data_path.suffix.lower()
+    if suffix == ".npy":
+        return "widefield-npy"
+    if suffix == ".csv":
+        return "2p-csv"
+    raise ValueError(
+        f"Cannot infer input format from {data_path.name!r}; use "
+        "--input-format widefield-npy or --input-format 2p-csv"
+    )
+
+
+def load_analysis_data(
+    data_path: Path, input_format: str
+) -> tuple[np.ndarray, dict[str, Any], Path | None, list[int], list[str]]:
+    """Load either native NCT blocks or a raw neuron-by-time 2p CSV.
+
+    The returned array always follows
+    ``[sequence, subsequence, region_or_neuron, time]`` so the sampling and
+    scoring code has one canonical representation.
+    """
+
+    if input_format == "widefield-npy":
+        data = np.load(data_path, mmap_mode="r", allow_pickle=False)
+        if data.ndim != 4:
+            raise ValueError(
+                "Expected processed data with shape "
+                f"[sequence,subsequence,region,time], got {data.shape}"
+            )
+        metadata_path = data_path.with_name(
+            f"{data_path.stem}_metadata.json"
+        )
+        input_metadata: dict[str, Any] = {}
+        if metadata_path.is_file():
+            input_metadata = json.loads(
+                metadata_path.read_text(encoding="utf-8")
+            )
+            metadata_shape = input_metadata.get("shape")
+            if (
+                metadata_shape is not None
+                and list(metadata_shape) != list(data.shape)
+            ):
+                raise ValueError(
+                    f"Metadata shape {metadata_shape} does not match data "
+                    f"shape {list(data.shape)} in {metadata_path}"
+                )
+            region_names = input_metadata.get("region_names")
+            if (
+                region_names is not None
+                and len(region_names) != data.shape[2]
+            ):
+                raise ValueError(
+                    f"Metadata has {len(region_names)} region names but data "
+                    f"has {data.shape[2]} regions"
+                )
+        return (
+            data,
+            input_metadata,
+            metadata_path if metadata_path.is_file() else None,
+            list(data.shape),
+            ["sequenceID", "subsequence", "region", "time"],
+        )
+
+    if input_format == "2p-csv":
+        matrix = pd.read_csv(
+            data_path, header=None, dtype=np.float32
+        ).to_numpy(copy=False)
+        if matrix.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D 2p trace matrix, got shape {matrix.shape}"
+            )
+        if matrix.shape[0] < 1 or matrix.shape[1] < 2:
+            raise ValueError(
+                f"Unexpectedly small 2p trace matrix: {matrix.shape}"
+            )
+        if not np.isfinite(matrix).all():
+            nonfinite = int(matrix.size - np.isfinite(matrix).sum())
+            raise ValueError(
+                f"2p CSV contains {nonfinite} non-finite values. Clean or "
+                "impute the raw trace matrix before this analysis."
+            )
+        n_neurons, n_timepoints = map(int, matrix.shape)
+        input_metadata = {
+            "source_type": "2p_traces_csv",
+            "source_csv": str(data_path),
+            "native_shape": [n_neurons, n_timepoints],
+            "native_axis_order": ["neuron", "time"],
+            "region_names": [
+                f"neuron_{index:03d}" for index in range(n_neurons)
+            ],
+        }
+        data = matrix[np.newaxis, np.newaxis, :, :]
+        return (
+            data,
+            input_metadata,
+            None,
+            [n_neurons, n_timepoints],
+            ["neuron", "time"],
+        )
+
+    raise ValueError(f"Unsupported input format: {input_format}")
 
 
 def _session_time_major(data: np.ndarray, sequence_id: int) -> np.ndarray:
@@ -467,7 +668,6 @@ def build_sample_plan(
                 "ceiling_end_exclusive": ceiling_start + window_length,
                 "temporal_shuffle_seed": int(rng.integers(0, max_seed)),
                 "time_region_shuffle_seed": int(rng.integers(0, max_seed)),
-                "factorized_null_seed": int(rng.integers(0, max_seed)),
             }
         )
     return pd.DataFrame(rows, columns=SAMPLE_COLUMNS)
@@ -490,73 +690,6 @@ def time_and_region_shuffle(
     """Permute all values without replacement across time and region."""
 
     return rng.permutation(reference.reshape(-1)).reshape(reference.shape)
-
-
-def fully_factorized_empirical_null(
-    data: np.ndarray,
-    *,
-    reference_sequence_id: int,
-    output_shape: tuple[int, int],
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Draw every output scalar independently from other sequenceIDs.
-
-    This is distributionally equivalent to::
-
-        pool = data[other_sequence_ids].reshape(-1)
-        surrogate = rng.choice(pool, size=output_shape, replace=True)
-
-    but it avoids materializing a roughly full-dataset copy for every
-    repetition. Non-finite padding entries, if present, are rejected so every
-    sampled scalar is a real finite observation.
-    """
-
-    if data.ndim != 4:
-        raise ValueError(
-            "Fully factorized null expects "
-            f"[sequence,subsequence,region,time], got {data.shape}"
-        )
-    n_sequences = int(data.shape[0])
-    if n_sequences < 2:
-        raise ValueError(
-            "Fully factorized null requires at least two sequenceIDs"
-        )
-    if not 0 <= reference_sequence_id < n_sequences:
-        raise ValueError(
-            f"reference_sequence_id={reference_sequence_id} is outside "
-            f"[0,{n_sequences})"
-        )
-    if len(output_shape) != 2 or any(int(size) <= 0 for size in output_shape):
-        raise ValueError(f"Invalid factorized-null output shape: {output_shape}")
-
-    values_per_sequence = int(np.prod(data.shape[1:], dtype=np.int64))
-    pooled_size = (n_sequences - 1) * values_per_sequence
-    flat_data = data.reshape(-1)
-    output = np.empty(int(np.prod(output_shape)), dtype=data.dtype)
-    remaining = np.arange(output.size, dtype=np.int64)
-
-    # Rejection sampling preserves uniform sampling over all finite entries in
-    # the pooled empirical null without allocating the full pooled vector.
-    for _ in range(100):
-        if remaining.size == 0:
-            break
-        pooled_indices = rng.integers(
-            0, pooled_size, size=remaining.size, dtype=np.int64
-        )
-        source_sequence = pooled_indices // values_per_sequence
-        source_sequence += source_sequence >= reference_sequence_id
-        within_sequence = pooled_indices % values_per_sequence
-        global_indices = source_sequence * values_per_sequence + within_sequence
-        sampled = np.asarray(flat_data[global_indices])
-        finite = np.isfinite(sampled)
-        output[remaining[finite]] = sampled[finite]
-        remaining = remaining[~finite]
-    if remaining.size:
-        raise ValueError(
-            "Could not draw enough finite values for the fully factorized "
-            "empirical null. Check the processed dataset for excessive NaNs."
-        )
-    return output.reshape(output_shape)
 
 
 def score_window_pair(
@@ -793,15 +926,6 @@ def run_repetition_scoring(
             candidates[TIME_REGION_FLOOR] = time_and_region_shuffle(
                 reference,
                 np.random.default_rng(int(plan_row["time_region_shuffle_seed"])),
-            )
-        if FACTORIZED_FLOOR in pending:
-            candidates[FACTORIZED_FLOOR] = fully_factorized_empirical_null(
-                data,
-                reference_sequence_id=sequence_id,
-                output_shape=reference.shape,
-                rng=np.random.default_rng(
-                    int(plan_row["factorized_null_seed"])
-                ),
             )
 
         metadata = {column: int(plan_row[column]) for column in SAMPLE_COLUMNS}
@@ -1263,6 +1387,25 @@ def _dose_score_label(score_name: str) -> str:
     return score_name.removesuffix("_score").replace("_", " ")
 
 
+def _save_svg_png(fig: plt.Figure, svg_path: Path, png_path: Path) -> None:
+    """Save both formats, retrying transient Windows overwrite failures."""
+    fig.savefig(svg_path, format="svg", bbox_inches="tight")
+    for attempt in range(5):
+        try:
+            with png_path.open("wb") as png_file:
+                fig.savefig(
+                    png_file,
+                    format="png",
+                    dpi=300,
+                    bbox_inches="tight",
+                )
+            return
+        except OSError as error:
+            if error.errno != 22 or attempt == 4:
+                raise
+            time.sleep(0.15 * (attempt + 1))
+
+
 def _draw_dose_response_panel(
     ax: plt.Axes,
     summary: pd.DataFrame,
@@ -1280,8 +1423,8 @@ def _draw_dose_response_panel(
     ax.set_title(_dose_score_label(score_name), fontsize=9)
     ax.set_xlim(-0.025, 1.025)
     ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
-    ax.grid(alpha=0.25)
-    ax.set_axisbelow(True)
+    ax.grid(False)
+    ax.spines[["top", "right"]].set_visible(False)
 
 
 def plot_variance_contraction_metrics(
@@ -1289,6 +1432,7 @@ def plot_variance_contraction_metrics(
     metric_columns: list[str],
     output_dir: Path,
 ) -> tuple[Path, Path]:
+    setup_plot_style()
     n_columns = 4
     n_rows = math.ceil(len(metric_columns) / n_columns)
     fig, axes = plt.subplots(
@@ -1311,8 +1455,7 @@ def plot_variance_contraction_metrics(
     fig.tight_layout()
     svg = output_dir / "variance_contraction_metric_dose_response.svg"
     png = output_dir / "variance_contraction_metric_dose_response.png"
-    fig.savefig(svg, format="svg", bbox_inches="tight")
-    fig.savefig(png, dpi=300, bbox_inches="tight")
+    _save_svg_png(fig, svg, png)
     plt.close(fig)
     return svg, png
 
@@ -1321,6 +1464,7 @@ def plot_variance_contraction_families_and_composite(
     summary: pd.DataFrame,
     output_dir: Path,
 ) -> tuple[Path, Path]:
+    setup_plot_style()
     score_names = FAMILY_COLUMNS + ["FINAL_COMPOSITE_SCORE"]
     colors = [
         "#4C78A8",
@@ -1330,23 +1474,174 @@ def plot_variance_contraction_families_and_composite(
         "#72B7B2",
         "#6F4E7C",
     ]
-    fig, axes = plt.subplots(
-        2, 3, figsize=(10.5, 6.2), sharex=True, sharey=True
+    fig, ax = plt.subplots(figsize=(7.2, 5.2))
+    for score_name, color in zip(score_names, colors):
+        subset = summary[
+            summary["score_name"] == score_name
+        ].sort_values("rho")
+        x = subset["rho"].to_numpy(dtype=float)
+        y = subset["bootstrap_mean"].to_numpy(dtype=float)
+        low = subset["bootstrap_ci95_low"].to_numpy(dtype=float)
+        high = subset["bootstrap_ci95_high"].to_numpy(dtype=float)
+        is_composite = score_name == "FINAL_COMPOSITE_SCORE"
+        ax.plot(
+            x,
+            y,
+            marker="o",
+            markersize=4.0,
+            linewidth=2.2 if is_composite else 1.6,
+            linestyle="--" if is_composite else "-",
+            color=color,
+            label=_dose_score_label(score_name),
+            zorder=3 if is_composite else 2,
+        )
+        ax.fill_between(
+            x,
+            low,
+            high,
+            color=color,
+            alpha=0.10,
+            linewidth=0,
+            zorder=1,
+        )
+    ax.set_xlim(-0.025, 1.025)
+    ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_xlabel("Retained temporal variance ratio (rho)")
+    ax.set_ylabel("Nethobench score (bootstrap mean and 95% CI)")
+    ax.set_title(
+        "Family and composite dose-response to variance contraction"
     )
-    for ax, score_name, color in zip(axes.flat, score_names, colors):
-        _draw_dose_response_panel(ax, summary, score_name, color=color)
-    fig.supxlabel("Retained temporal variance ratio (rho)")
-    fig.supylabel("Nethobench score (bootstrap mean and 95% CI)")
-    fig.suptitle(
-        "Family and composite dose-response to ceiling-window variance contraction"
-    )
+    ax.grid(False)
+    ax.legend(frameon=False, fontsize=8, ncol=2)
+    ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     svg = output_dir / "variance_contraction_family_composite_dose_response.svg"
     png = output_dir / "variance_contraction_family_composite_dose_response.png"
-    fig.savefig(svg, format="svg", bbox_inches="tight")
-    fig.savefig(png, dpi=300, bbox_inches="tight")
+    _save_svg_png(fig, svg, png)
     plt.close(fig)
     return svg, png
+
+
+def load_cached_variance_contraction_results(
+    output_dir: Path,
+    *,
+    data_path: Path,
+    samples_path: Path,
+    window_length: int,
+    repetitions: int,
+    batches: int,
+    seed: int,
+    rhos: list[float],
+    bootstrap_count: int,
+    score_columns: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, np.ndarray] | None:
+    """Load compatible dose-response estimates instead of rescoring arrays."""
+    results_path = output_dir / "variance_contraction_dose_response_results.json"
+    repetition_path = output_dir / "variance_contraction_repetition_scores.csv"
+    batch_path = output_dir / "variance_contraction_batch_scores.csv"
+    bootstrap_path = output_dir / "variance_contraction_bootstrap_summary.csv"
+    bootstrap_indices_path = (
+        output_dir / "variance_contraction_bootstrap_indices.csv"
+    )
+    required = (
+        results_path,
+        repetition_path,
+        batch_path,
+        bootstrap_path,
+        bootstrap_indices_path,
+    )
+    if not all(path.is_file() for path in required):
+        return None
+
+    try:
+        payload = json.loads(results_path.read_text(encoding="utf-8"))
+        config = payload["config"]
+        cached_rhos = np.asarray(
+            config["retained_variance_ratios"], dtype=float
+        )
+        requested_rhos = np.asarray(rhos, dtype=float)
+        compatible = (
+            Path(config["data_path"]).resolve() == data_path.resolve()
+            and Path(config["sampled_windows_csv"]).resolve()
+            == samples_path.resolve()
+            and int(config["window_length"]) == window_length
+            and int(config["repetitions"]) == repetitions
+            and int(config["batches"]) == batches
+            and int(config["seed"]) == seed
+            and int(config["bootstrap_count"]) == bootstrap_count
+            and cached_rhos.shape == requested_rhos.shape
+            and np.allclose(cached_rhos, requested_rhos, rtol=0.0, atol=1e-12)
+            and list(payload["score_columns"]) == score_columns
+        )
+        if not compatible:
+            print("Saved variance-contraction results are incompatible; rescoring")
+            return None
+
+        repetition_scores = pd.read_csv(repetition_path)
+        batch_scores = pd.read_csv(batch_path)
+        bootstrap_summary = pd.read_csv(bootstrap_path)
+        bootstrap_frame = pd.read_csv(bootstrap_indices_path)
+        expected_repetition_keys = {
+            (repetition, round(rho, 12))
+            for repetition in range(repetitions)
+            for rho in rhos
+        }
+        observed_repetition_keys = {
+            (int(row["repetition"]), round(float(row["rho"]), 12))
+            for row in repetition_scores.to_dict(orient="records")
+        }
+        expected_batch_keys = {
+            (batch, round(rho, 12))
+            for batch in range(batches)
+            for rho in rhos
+        }
+        observed_batch_keys = {
+            (int(row["batch"]), round(float(row["rho"]), 12))
+            for row in batch_scores.to_dict(orient="records")
+        }
+        expected_summary_keys = {
+            (score, round(rho, 12))
+            for score in score_columns
+            for rho in rhos
+        }
+        observed_summary_keys = {
+            (str(row["score_name"]), round(float(row["rho"]), 12))
+            for row in bootstrap_summary.to_dict(orient="records")
+        }
+        draw_columns = [
+            column
+            for column in bootstrap_frame.columns
+            if column.startswith("batch_draw_")
+        ]
+        required_score_columns = set(score_columns)
+        if (
+            observed_repetition_keys != expected_repetition_keys
+            or observed_batch_keys != expected_batch_keys
+            or observed_summary_keys != expected_summary_keys
+            or not required_score_columns.issubset(repetition_scores.columns)
+            or not required_score_columns.issubset(batch_scores.columns)
+            or len(bootstrap_frame) != bootstrap_count
+            or len(draw_columns) != batches
+        ):
+            print("Saved variance-contraction tables are incomplete; rescoring")
+            return None
+        bootstrap_indices = bootstrap_frame[draw_columns].to_numpy(
+            dtype=np.int64
+        )
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
+        print(f"Could not reuse saved variance-contraction results: {error}")
+        return None
+
+    print(
+        "Reusing cached variance-contraction repetition, batch, and bootstrap "
+        "estimates"
+    )
+    return (
+        repetition_scores,
+        batch_scores,
+        bootstrap_summary,
+        bootstrap_indices,
+    )
 
 
 def score_batches(
@@ -1358,8 +1653,8 @@ def score_batches(
 ) -> pd.DataFrame:
     """Score every empirical batch jointly, matching model split scoring.
 
-    Repetition-level scores remain useful for the 200-draw sampling
-    distribution. These joint batch scores are the correct reference for model
+    Repetition-level scores describe the sampled-pair distribution. These
+    joint batch scores are the correct reference for model
     split normalization because Nethobench contains nonlinear reductions across
     sequences.
     """
@@ -1399,16 +1694,6 @@ def score_batches(
                     ),
                 )
             )
-            candidates[FACTORIZED_FLOOR].append(
-                fully_factorized_empirical_null(
-                    data,
-                    reference_sequence_id=int(plan_row["sequence_id"]),
-                    output_shape=reference.shape,
-                    rng=np.random.default_rng(
-                        int(plan_row["factorized_null_seed"])
-                    ),
-                )
-            )
 
         gt_batch = np.stack(references, axis=0)
         for condition in CONDITIONS:
@@ -1438,9 +1723,12 @@ def score_batches(
 
 
 def plot_empirical_references(
-    batch_summary: pd.DataFrame, output_dir: Path
+    batch_summary: pd.DataFrame,
+    output_dir: Path,
+    *,
+    output_prefix: str,
 ) -> tuple[Path, Path]:
-    mpl.rcParams["svg.fonttype"] = "none"
+    setup_plot_style()
     fig, ax = plt.subplots(figsize=(8.4, 4.7))
     x = np.arange(len(PLOT_SCORE_COLUMNS))
     n_conditions = len(CONDITIONS)
@@ -1464,8 +1752,8 @@ def plot_empirical_references(
             width=bar_width,
             label=CONDITION_LABELS[condition],
             color=CONDITION_COLORS[condition],
-            edgecolor="black",
-            linewidth=0.6,
+            edgecolor="none",
+            linewidth=0.0,
             alpha=0.9,
             yerr=np.nan_to_num(errors, nan=0.0),
             capsize=2.5,
@@ -1475,20 +1763,26 @@ def plot_empirical_references(
     ax.set_xticks(x)
     ax.set_xticklabels([PLOT_SCORE_LABELS[c] for c in PLOT_SCORE_COLUMNS], fontsize=10)
     ax.set_ylabel("Nethobench score")
-    ax.grid(axis="y", alpha=0.3)
-    ax.set_axisbelow(True)
+    ax.grid(False)
+    ax.spines[["top", "right"]].set_visible(False)
     ax.set_ylim(0.0, 1.05)
     ax.legend(frameon=False, fontsize=8.5, ncol=2)
     fig.tight_layout()
-    svg_path = output_dir / "widefield_ceiling_floor_family_scores.svg"
-    png_path = output_dir / "widefield_ceiling_floor_family_scores.png"
-    fig.savefig(svg_path, format="svg", bbox_inches="tight")
-    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    svg_path = output_dir / f"{output_prefix}_ceiling_floor_family_scores.svg"
+    png_path = output_dir / f"{output_prefix}_ceiling_floor_family_scores.png"
+    _save_svg_png(fig, svg_path, png_path)
     plt.close(fig)
     return svg_path, png_path
 
 
 def load_model_cache(path: Path, expected_batches: int) -> tuple[dict, list[str]]:
+    """Load cached model scores without invoking Nethobench scoring.
+
+    The current three-seed cache is organized as training seed -> model ->
+    split. Corresponding splits are averaged across training seeds so they
+    remain aligned with the four empirical ceiling/floor batches. The legacy
+    ``per_split`` cache schema remains supported for explicit overrides.
+    """
     if not path.is_file():
         raise FileNotFoundError(f"Model score cache not found: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1501,7 +1795,59 @@ def load_model_cache(path: Path, expected_batches: int) -> tuple[dict, list[str]
         )
     per_split = payload.get("per_split")
     if not isinstance(per_split, dict) or not per_split:
-        raise ValueError(f"{path} does not contain a non-empty 'per_split' mapping")
+        seed_scores = payload.get("scores")
+        if not isinstance(seed_scores, dict) or not seed_scores:
+            raise ValueError(
+                f"{path} contains neither a non-empty 'scores' nor "
+                "'per_split' mapping"
+            )
+
+        training_seeds = list(seed_scores)
+        declared_models = signature.get("models", [])
+        available_models = list(declared_models) or list(
+            next(iter(seed_scores.values()))
+        )
+        per_split = {}
+        for model in available_models:
+            split_scores_by_seed: list[list[Mapping[str, Any]]] = []
+            for training_seed in training_seeds:
+                seed_mapping = seed_scores[training_seed]
+                if not isinstance(seed_mapping, dict) or model not in seed_mapping:
+                    raise ValueError(
+                        f"{path} is missing model {model!r} for training seed "
+                        f"{training_seed!r}"
+                    )
+                splits = seed_mapping[model]
+                if not isinstance(splits, list) or len(splits) != expected_batches:
+                    raise ValueError(
+                        f"{model} at training seed {training_seed} has "
+                        f"{len(splits) if isinstance(splits, list) else 'invalid'} "
+                        f"splits; expected {expected_batches}"
+                    )
+                split_scores_by_seed.append(splits)
+
+            averaged_splits: list[dict[str, float]] = []
+            for split_index in range(expected_batches):
+                score_names = list(split_scores_by_seed[0][split_index])
+                averaged_splits.append(
+                    {
+                        score_name: float(
+                            np.mean(
+                                [
+                                    float(seed_splits[split_index][score_name])
+                                    for seed_splits in split_scores_by_seed
+                                ]
+                            )
+                        )
+                        for score_name in score_names
+                    }
+                )
+            per_split[model] = averaged_splits
+
+        print(
+            f"Loaded cached model scores from {len(training_seeds)} training "
+            "seeds; averaged corresponding splits without recomputing scores"
+        )
     models = [model for model in MODEL_ORDER if model in per_split]
     models.extend(model for model in per_split if model not in models)
     for model in models:
@@ -1637,7 +1983,7 @@ def plot_normalized_models(
     floor_condition: str,
     clipped: bool,
 ) -> tuple[Path, Path]:
-    mpl.rcParams["svg.fonttype"] = "none"
+    setup_plot_style()
     plot_models = [model for model in MODEL_ORDER if model in models]
     plot_models.extend(model for model in models if model not in plot_models)
     x = np.arange(len(PLOT_SCORE_COLUMNS))
@@ -1675,8 +2021,8 @@ def plot_normalized_models(
             width=bar_width,
             label=model,
             color=MODEL_COLORS.get(model),
-            edgecolor="black",
-            linewidth=0.55,
+            edgecolor="none",
+            linewidth=0.0,
             alpha=0.9,
             yerr=np.nan_to_num(errors, nan=0.0),
             capsize=1.8,
@@ -1710,8 +2056,8 @@ def plot_normalized_models(
     ax.set_xticks(x)
     ax.set_xticklabels([PLOT_SCORE_LABELS[c] for c in PLOT_SCORE_COLUMNS], fontsize=10)
     ax.set_ylabel("Ceiling/floor-normalized score")
-    ax.grid(axis="y", alpha=0.3)
-    ax.set_axisbelow(True)
+    ax.grid(False)
+    ax.spines[["top", "right"]].set_visible(False)
 
     finite_plot = np.asarray(plotted_values, dtype=float)
     finite_plot = finite_plot[np.isfinite(finite_plot)]
@@ -1725,17 +2071,13 @@ def plot_normalized_models(
     clip_label = "clipped" if clipped else "unclipped"
     ax.set_title(f"Model scores normalized to empirical ceiling and {floor_label} ({clip_label})")
     fig.tight_layout()
-    floor_tags = {
-        TEMPORAL_FLOOR: "temporal",
-        TIME_REGION_FLOOR: "time_region",
-        FACTORIZED_FLOOR: "fully_factorized",
-    }
-    tag = floor_tags[floor_condition]
+    if floor_condition != TIME_REGION_FLOOR:
+        raise ValueError(f"Unsupported normalization floor: {floor_condition}")
+    tag = "time_region"
     clip_tag = "_clipped" if clipped else "_unclipped"
     svg_path = output_dir / f"normalized_model_family_scores_{tag}{clip_tag}.svg"
     png_path = output_dir / f"normalized_model_family_scores_{tag}{clip_tag}.png"
-    fig.savefig(svg_path, format="svg", bbox_inches="tight")
-    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    _save_svg_png(fig, svg_path, png_path)
     plt.close(fig)
     return svg_path, png_path
 
@@ -1761,37 +2103,59 @@ def main(argv: list[str] | None = None) -> None:
     _validate_args(args)
     data_path = args.data_path.resolve()
     model_cache_path = args.model_cache.resolve()
-    output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     if not data_path.is_file():
-        raise FileNotFoundError(f"Processed data not found: {data_path}")
-    data = np.load(data_path, mmap_mode="r", allow_pickle=False)
-    if data.ndim != 4:
-        raise ValueError(
-            "Expected processed data with shape "
-            f"[sequence,subsequence,region,time], got {data.shape}"
+        raise FileNotFoundError(f"Input data not found: {data_path}")
+    input_format = _resolve_input_format(data_path, args.input_format)
+    (
+        data,
+        input_metadata,
+        metadata_path,
+        native_shape,
+        native_axis_order,
+    ) = load_analysis_data(data_path, input_format)
+
+    if args.output_dir is not None:
+        output_dir = args.output_dir.resolve()
+    elif input_format == "widefield-npy":
+        output_dir = (
+            REPO_ROOT / "output" / "widefield_empirical_ceiling_floor"
         )
-    if data.shape[2] != args.expected_regions:
-        raise ValueError(
-            f"Expected {args.expected_regions} regions, found {data.shape[2]}"
+    else:
+        output_dir = (
+            REPO_ROOT
+            / "output"
+            / "2p_empirical_ceiling_floor"
+            / data_path.stem
         )
-    metadata_path = data_path.with_name(f"{data_path.stem}_metadata.json")
-    input_metadata: dict[str, Any] = {}
-    if metadata_path.is_file():
-        input_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        metadata_shape = input_metadata.get("shape")
-        if metadata_shape is not None and list(metadata_shape) != list(data.shape):
-            raise ValueError(
-                f"Metadata shape {metadata_shape} does not match data shape "
-                f"{list(data.shape)} in {metadata_path}"
-            )
-        region_names = input_metadata.get("region_names")
-        if region_names is not None and len(region_names) != data.shape[2]:
-            raise ValueError(
-                f"Metadata has {len(region_names)} region names but data has "
-                f"{data.shape[2]} regions"
-            )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    expected_regions = args.expected_regions
+    if expected_regions is None and input_format == "widefield-npy":
+        expected_regions = 16
+    if expected_regions is not None and data.shape[2] != expected_regions:
+        raise ValueError(
+            f"Expected {expected_regions} regions/neurons, found "
+            f"{data.shape[2]}"
+        )
+
+    should_normalize_models = (
+        not args.skip_model_normalization
+        and (
+            input_format == "widefield-npy"
+            or args.normalize_model_scores
+        )
+    )
+    if (
+        input_format == "2p-csv"
+        and not args.skip_model_normalization
+        and not args.normalize_model_scores
+    ):
+        print(
+            "2p CSV input: model-cache normalization is disabled by default. "
+            "Use --normalize-model-scores to opt in with a comparable cache."
+        )
+
     total_timesteps = int(data.shape[1] * data.shape[3])
     if total_timesteps < 2 * args.window_length:
         raise ValueError(
@@ -1800,13 +2164,37 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     print(f"Input: {data_path}")
-    print(f"Shape: {tuple(data.shape)} [sequence, subsequence, region, time]")
+    print(f"Input format: {input_format}")
+    print(
+        f"Canonical shape: {tuple(data.shape)} "
+        "[sequence, subsequence, region/neuron, time]"
+    )
     print(
         f"Concatenated session length: {total_timesteps}; "
         f"window length: {args.window_length}"
     )
     eligible = discover_eligible_sessions(data, args.window_length)
     print(f"Eligible sequenceIDs: {len(eligible)}/{data.shape[0]}")
+    if args.sequence_id is not None:
+        if args.sequence_id >= data.shape[0]:
+            raise ValueError(
+                f"--sequence-id {args.sequence_id} is out of range for "
+                f"{data.shape[0]} sequences (valid IDs: 0-{data.shape[0] - 1})"
+            )
+        eligible = [
+            session
+            for session in eligible
+            if session.sequence_id == args.sequence_id
+        ]
+        if not eligible:
+            raise ValueError(
+                f"SequenceID {args.sequence_id} cannot provide two finite, "
+                f"non-overlapping windows of {args.window_length} timesteps"
+            )
+        print(
+            f"Restricting all repetitions to sequenceID {args.sequence_id} "
+            f"with RNG seed {args.seed}"
+        )
 
     plan = build_sample_plan(
         eligible,
@@ -1874,7 +2262,11 @@ def main(argv: list[str] | None = None) -> None:
     batch_summary.to_csv(batch_summary_path, index=False)
 
     empirical_svg, empirical_png = plot_empirical_references(
-        batch_summary, output_dir
+        batch_summary,
+        output_dir,
+        output_prefix=(
+            "widefield" if input_format == "widefield-npy" else "2p"
+        ),
     )
 
     variance_contraction_repetition_scores = pd.DataFrame()
@@ -1893,26 +2285,48 @@ def main(argv: list[str] | None = None) -> None:
             "\nRunning paired variance-contraction dose-response at rho="
             + ", ".join(f"{rho:g}" for rho in rhos)
         )
-        variance_contraction_repetition_scores = (
-            run_variance_contraction_repetition_scoring(
-                data,
-                plan,
-                window_length=args.window_length,
-                rhos=rhos,
-            )
-        )
         dose_score_columns = _dose_response_score_columns(score_columns)
+        cached_variance_results = load_cached_variance_contraction_results(
+            output_dir,
+            data_path=data_path,
+            samples_path=samples_path,
+            window_length=args.window_length,
+            repetitions=args.repetitions,
+            batches=args.batches,
+            seed=args.seed,
+            rhos=rhos,
+            bootstrap_count=args.variance_contraction_bootstrap_count,
+            score_columns=dose_score_columns,
+        )
+        if cached_variance_results is None:
+            variance_contraction_repetition_scores = (
+                run_variance_contraction_repetition_scoring(
+                    data,
+                    plan,
+                    window_length=args.window_length,
+                    rhos=rhos,
+                )
+            )
+            variance_contraction_batch_scores = (
+                score_variance_contraction_batches(
+                    data,
+                    plan,
+                    window_length=args.window_length,
+                    rhos=rhos,
+                    score_columns=score_columns,
+                )
+            )
+        else:
+            (
+                variance_contraction_repetition_scores,
+                variance_contraction_batch_scores,
+                variance_contraction_bootstrap_summary,
+                variance_contraction_bootstrap_indices,
+            ) = cached_variance_results
         variance_contraction_repetition_summary = summarize_values(
             variance_contraction_repetition_scores,
             ["rho"],
             dose_score_columns,
-        )
-        variance_contraction_batch_scores = score_variance_contraction_batches(
-            data,
-            plan,
-            window_length=args.window_length,
-            rhos=rhos,
-            score_columns=score_columns,
         )
         variance_contraction_batch_summary = summarize_values(
             variance_contraction_batch_scores,
@@ -1976,20 +2390,21 @@ def main(argv: list[str] | None = None) -> None:
             )
         variance_contraction_validation = pd.DataFrame(validation_rows)
 
-        variance_contraction_bootstrap_indices = (
-            build_paired_bootstrap_indices(
-                args.batches,
-                args.variance_contraction_bootstrap_count,
-                args.seed,
+        if cached_variance_results is None:
+            variance_contraction_bootstrap_indices = (
+                build_paired_bootstrap_indices(
+                    args.batches,
+                    args.variance_contraction_bootstrap_count,
+                    args.seed,
+                )
             )
-        )
-        variance_contraction_bootstrap_summary = (
-            summarize_variance_contraction_bootstrap(
-                variance_contraction_batch_scores,
-                dose_score_columns,
-                variance_contraction_bootstrap_indices,
+            variance_contraction_bootstrap_summary = (
+                summarize_variance_contraction_bootstrap(
+                    variance_contraction_batch_scores,
+                    dose_score_columns,
+                    variance_contraction_bootstrap_indices,
+                )
             )
-        )
         batch_ids = np.asarray(
             sorted(
                 int(value)
@@ -2139,12 +2554,8 @@ def main(argv: list[str] | None = None) -> None:
     normalized = pd.DataFrame()
     normalized_summary = pd.DataFrame()
     normalized_paths: dict[str, str] = {}
-    floor_condition = {
-        "temporal": TEMPORAL_FLOOR,
-        "time-and-region": TIME_REGION_FLOOR,
-        "fully-factorized": FACTORIZED_FLOOR,
-    }[args.normalization_floor]
-    if not args.skip_model_normalization:
+    floor_condition = TIME_REGION_FLOOR
+    if should_normalize_models:
         per_split, models = load_model_cache(model_cache_path, args.batches)
         normalized = normalize_model_scores(
             per_split,
@@ -2173,19 +2584,26 @@ def main(argv: list[str] | None = None) -> None:
             "plot_png": str(normalized_png),
         }
 
-    results_path = output_dir / "widefield_ceiling_floor_results.json"
+    results_path = output_dir / (
+        "widefield_ceiling_floor_results.json"
+        if input_format == "widefield-npy"
+        else "2p_ceiling_floor_results.json"
+    )
     payload = {
         "config": {
             "data_path": str(data_path),
+            "input_format": input_format,
             "model_cache": (
-                None if args.skip_model_normalization else str(model_cache_path)
+                str(model_cache_path) if should_normalize_models else None
             ),
+            "model_normalization_enabled": should_normalize_models,
             "output_dir": str(output_dir),
             "window_length": args.window_length,
             "repetitions": args.repetitions,
             "batches": args.batches,
             "seed": args.seed,
-            "expected_regions": args.expected_regions,
+            "sequence_id": args.sequence_id,
+            "expected_regions": expected_regions,
             "normalization_floor": floor_condition,
             "clip_normalized": bool(args.clip_normalized),
             "variance_contraction_dose_response": {
@@ -2233,22 +2651,30 @@ def main(argv: list[str] | None = None) -> None:
                 "joint Nethobench scoring of all repetition windows stacked "
                 "within each contiguous batch"
             ),
-            "fully_factorized_null": (
-                "each output scalar is sampled independently with replacement "
-                "from finite values pooled over every non-reference sequenceID, "
-                "all subsequences, all timepoints, and all regions"
-            ),
         },
         "input": {
+            "format": input_format,
+            "native_shape": native_shape,
+            "native_axis_order": native_axis_order,
             "shape": list(data.shape),
-            "axis_order": ["sequenceID", "subsequence", "region", "time"],
+            "axis_order": [
+                "sequenceID",
+                "subsequence",
+                "region_or_neuron",
+                "time",
+            ],
             "concatenated_timesteps_per_sequence": total_timesteps,
             "eligible_sequence_ids": [entry.sequence_id for entry in eligible],
-            "metadata_path": str(metadata_path) if metadata_path.is_file() else None,
+            "metadata_path": (
+                str(metadata_path) if metadata_path is not None else None
+            ),
             "region_names": input_metadata.get("region_names"),
             "sequence_id_definition": (
-                "axis-0 index in the processed array; for data100_ba16.npy this "
-                "equals the sorted source sequenceId"
+                "the sole continuous recording represented by the 2p CSV"
+                if input_format == "2p-csv"
+                else
+                "axis-0 index in the processed array; for data100_ba16.npy "
+                "this equals the sorted source sequenceId"
             ),
             "batch_sizes": {
                 str(int(batch)): int(count)

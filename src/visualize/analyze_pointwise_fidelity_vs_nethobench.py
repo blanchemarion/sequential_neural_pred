@@ -34,11 +34,12 @@ from itertools import combinations
 from pathlib import Path
 from typing import Mapping
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
+
+from cns_plotting import setup_cnsplots_style
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _NETHOBENCH_ROOT = _REPO_ROOT / "nethobench"
@@ -413,7 +414,7 @@ def pairwise_fidelity_structure_test(table: pd.DataFrame) -> dict[str, object]:
 
 
 def setup_plot_style() -> None:
-    mpl.rcParams.update(
+    setup_cnsplots_style(
         {
             "figure.dpi": 120,
             "savefig.dpi": 300,

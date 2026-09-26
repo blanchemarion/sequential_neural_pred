@@ -25,19 +25,42 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
+import matplotlib.transforms as mtransforms
 import numpy as np
 import pandas as pd
 
+from cns_plotting import setup_cnsplots_style
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _NETHOBENCH_ROOT = _REPO_ROOT / "nethobench"
-if str(_NETHOBENCH_ROOT) not in sys.path:
-    sys.path.insert(0, str(_NETHOBENCH_ROOT))
+if not (_NETHOBENCH_ROOT / "nethobench" / "__init__.py").is_file():
+    raise RuntimeError(
+        f"Required nethobench checkout not found: {_NETHOBENCH_ROOT}"
+    )
+_nb_path = str(_NETHOBENCH_ROOT.resolve())
+if _nb_path in sys.path:
+    sys.path.remove(_nb_path)
+sys.path.insert(0, _nb_path)
 
 from nethobench.neuro.metrics.composites import calculate_neuro_composites
+from nethobench.analysis.score_definitions import NEURO_FAMILY_METRICS
+
+
+_REQUIRED_TEMPORAL_METRICS = {
+    "TRJDIST_score01",
+    "ACF_score01",
+    "PSD_score01",
+}
+_temporal_metrics = set(NEURO_FAMILY_METRICS["temporal_spectral"])
+if not _REQUIRED_TEMPORAL_METRICS.issubset(_temporal_metrics):
+    raise RuntimeError(
+        "The selected Nethobench checkout lacks the current temporal metrics: "
+        f"{sorted(_REQUIRED_TEMPORAL_METRICS - _temporal_metrics)}"
+    )
 
 
 DEFAULT_EXCLUDED_REGIONS = (50, 51, 52, 56, 77, 87)
@@ -193,7 +216,7 @@ def save_family_plot(
     sems: dict[str, float],
     output_path: Path,
 ) -> None:
-    mpl.rcParams.update(
+    setup_cnsplots_style(
         {
             "figure.dpi": 120,
             "savefig.dpi": 300,
@@ -239,6 +262,120 @@ def save_family_plot(
     fig.tight_layout()
     fig.savefig(output_path, format="svg", bbox_inches="tight")
     fig.savefig(output_path.with_suffix(".png"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_metric_dotplot(
+    means: dict[str, float],
+    sems: dict[str, float],
+    output_path: Path,
+) -> None:
+    """Plot every leaf metric grouped by its canonical NethoBench family."""
+    setup_cnsplots_style(
+        {
+            "figure.dpi": 120,
+            "savefig.dpi": 300,
+            "svg.fonttype": "none",
+            "axes.linewidth": 0.8,
+            "font.size": 9,
+        }
+    )
+    family_metric_map = OrderedDict(
+        (family, list(metrics))
+        for family, metrics in NEURO_FAMILY_METRICS.items()
+    )
+    all_metrics = [
+        metric
+        for metrics in family_metric_map.values()
+        for metric in metrics
+    ]
+    metric_labels = [
+        metric.replace("_score01", "").replace("_", " ")
+        for metric in all_metrics
+    ]
+    values = np.asarray(
+        [means.get(metric, np.nan) for metric in all_metrics], dtype=float
+    )
+    errors = np.asarray(
+        [sems.get(metric, np.nan) for metric in all_metrics], dtype=float
+    )
+    errors = np.nan_to_num(errors, nan=0.0)
+    y = np.arange(len(all_metrics))
+
+    fig, ax = plt.subplots(figsize=(10.8, 7.1))
+    fig.subplots_adjust(left=0.50, right=0.98, top=0.90, bottom=0.10)
+    family_blocks: list[tuple[str, int, int]] = []
+    start = 0
+    for family_index, (family, metrics) in enumerate(
+        family_metric_map.items()
+    ):
+        end = start + len(metrics) - 1
+        family_blocks.append((family, start, end))
+        if family_index % 2 == 0:
+            ax.axhspan(
+                start - 0.5,
+                end + 0.5,
+                color="#F6F6F6",
+                zorder=0,
+            )
+        if end < len(all_metrics) - 1:
+            ax.axhline(
+                end + 0.5,
+                color="#B0B0B0",
+                linewidth=1.0,
+                linestyle=(0, (3, 3)),
+                zorder=1,
+            )
+        start = end + 1
+
+    finite = np.isfinite(values)
+    ax.errorbar(
+        values[finite],
+        y[finite],
+        xerr=errors[finite],
+        fmt="o",
+        markersize=6.0,
+        color="#A23B72",
+        ecolor="#A23B72",
+        elinewidth=1.0,
+        capsize=2.0,
+        label="MLP-2p",
+        zorder=3,
+    )
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xticks(np.arange(0.0, 1.01, 0.2))
+    ax.set_xlabel(
+        "Nethobench subscore (mean ± SEM over sequence splits)",
+        fontsize=9,
+    )
+    ax.set_yticks(y)
+    ax.set_yticklabels(metric_labels, fontsize=9)
+    ax.invert_yaxis()
+    ax.xaxis.grid(True, color="#D0D0D0", linewidth=0.8)
+    ax.yaxis.grid(False)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(axis="y", length=0, pad=6)
+
+    transform = mtransforms.blended_transform_factory(
+        ax.transAxes, ax.transData
+    )
+    for family, start, end in family_blocks:
+        ax.annotate(
+            family.replace("_", " ").title(),
+            xy=(0, 0.5 * (start + end)),
+            xycoords=transform,
+            xytext=(-160, 0),
+            textcoords="offset points",
+            rotation=60,
+            ha="right",
+            va="center",
+            fontsize=10,
+            fontweight="bold",
+            color="#555555",
+        )
+    ax.legend(frameon=False, fontsize=9, loc="upper center")
+    fig.savefig(output_path, format="svg", bbox_inches="tight")
+    fig.savefig(output_path.with_suffix(".png"), dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -320,6 +457,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         output_dir / "submetric_scores_MLP_2p_filtered_regions_4split.csv"
     )
     plot_path = output_dir / "family_scores_MLP_2p_filtered_regions_4split.svg"
+    dotplot_path = output_dir / "metric_dotplot_mlp_2p_4split.svg"
 
     payload = {
         "model": "MLP_2p",
@@ -361,6 +499,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         }
     ).to_csv(submetric_csv_path, float_format="%.8f")
     save_family_plot(means, sems, plot_path)
+    save_metric_dotplot(means, sems, dotplot_path)
 
     print("\nFamily/composite mean ± SEM:")
     for key, label in FAMILY_SCORES.items():
@@ -374,6 +513,7 @@ def main(argv: list[str] | None = None) -> dict[str, Path]:
         "family_csv": family_csv_path,
         "submetric_csv": submetric_csv_path,
         "plot": plot_path,
+        "metric_dotplot": dotplot_path,
     }
 
 

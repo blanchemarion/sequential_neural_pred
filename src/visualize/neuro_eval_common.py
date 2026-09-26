@@ -15,9 +15,10 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-import matplotlib as mpl
 import numpy as np
 import pandas as pd
+
+from cns_plotting import setup_cnsplots_style
 
 SUB_DATA_DIR = "90_810"
 N_SPLITS = 4
@@ -26,6 +27,8 @@ EPS = 1e-8
 MODEL_FILES = OrderedDict(
     [
         ("VAR", "long_predictions_90_810_VAR_BASELINE.npy"),
+        ("SSM", "long_predictions_90_810_cDMM_SSM.npy"),
+        ("RNN", "long_predictions_90_810_GRU_AR.npy"),
         ("1_step", "long_predictions_90_810_1_step.npy"),
         ("AR", "long_predictions_90_810_AR_KV.npy"),
         ("TF", "long_predictions_90_810_TF.npy"),
@@ -41,6 +44,8 @@ GT_FILES = {
 
 MODEL_TO_GT = {
     "VAR": "bench",
+    "SSM": "bench",
+    "RNN": "bench",
     "1_step": "bench",
     "AR": "bench",
     "TF": "bench",
@@ -51,6 +56,8 @@ MODEL_TO_GT = {
 MODEL_ORDER = list(MODEL_FILES)
 MODEL_LABELS = {
     "VAR": "VAR",
+    "SSM": "SSM",
+    "RNN": "RNN",
     "1_step": "1_step",
     "AR": "AR",
     "TF": "TF",
@@ -58,12 +65,14 @@ MODEL_LABELS = {
     "sequifier": "Sequifier",
 }
 MODEL_COLORS = {
-    "VAR": "#3E7CB1",
+    "VAR": "#4DBBD5",
+    "SSM": "#3C5488",
+    "RNN": "#E64B35",
     "1_step": "#7A7A7A",
-    "AR": "#2AA876",
-    "TF": "#A23B72",
-    "TF_QL_0.08_KL_0.02": "#6A4C93",
-    "sequifier": "#C46410",
+    "AR": "#00A087",
+    "TF": "#EFC000",
+    "TF_QL_0.08_KL_0.02": "#B24775",
+    "sequifier": "#7E57C2",
 }
 
 # Matches ``neuro_metric_specific_visualizations_90_810`` (includes K12 occupancy).
@@ -103,7 +112,7 @@ class ModelArrays:
 
 
 def setup_plot_style() -> None:
-    mpl.rcParams.update(
+    setup_cnsplots_style(
         {
             "figure.dpi": 120,
             "savefig.dpi": 300,

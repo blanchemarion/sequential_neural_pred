@@ -2,10 +2,11 @@
 """
 Metric-faithful Nethobench diagnostic visualizations for the 90_810 arrays.
 
-Tensor paths default to ``evaluation_results/90_810/seed_102``; figures and score
-CSVs go under ``output/neuro_metric_specific_visualizations_90_810/`` at the repo root.
-The family plots use official ``compute_neuro_scores`` outputs; the figures here
-visualize the raw quantities that feed each selected official submetric.
+Tensor paths default to the three training-seed directories below
+``evaluation_results/90_810``. Figures and score CSVs go under
+``output/neuro_metric_specific_visualizations_90_810/`` at the repo root.
+Official score tables are read from the three-seed score cache by default; the
+figures visualize raw quantities aggregated across those same predictions.
 
 When official helpers expose the intermediate, this file imports them.  For the
 notebook-only metrics (KL/JSD, QNT, Mean), the extractor functions below mirror
@@ -17,24 +18,45 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _NETHOBENCH_INSTALL = _REPO_ROOT / "nethobench"
-if (_NETHOBENCH_INSTALL / "nethobench" / "__init__.py").is_file():
-    _nb_path = str(_NETHOBENCH_INSTALL.resolve())
-    if _nb_path not in sys.path:
-        sys.path.insert(0, _nb_path)
+if not (_NETHOBENCH_INSTALL / "nethobench" / "__init__.py").is_file():
+    raise RuntimeError(
+        f"Required Nethobench checkout not found: {_NETHOBENCH_INSTALL}"
+    )
+_nb_path = str(_NETHOBENCH_INSTALL.resolve())
+if _nb_path not in sys.path:
+    sys.path.insert(0, _nb_path)
 
-NETHOBENCH_PKG = _REPO_ROOT / "nethobench" / "nethobench"
+NETHOBENCH_PKG = _NETHOBENCH_INSTALL / "nethobench"
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import TwoSlopeNorm
+from nethobench.neuro.metrics import additional as addm
+from nethobench.neuro.metrics import sensitive as smc
 from scipy.linalg import subspace_angles
 from scipy.stats import entropy, kurtosis, skew
+
+from neuro_scoring_windows import align_forecast_only
+
+_SENSITIVE_MODULE_PATH = Path(smc.__file__).resolve()
+if _NETHOBENCH_INSTALL.resolve() not in _SENSITIVE_MODULE_PATH.parents:
+    raise RuntimeError(
+        "Resolved Nethobench metrics outside nethobench: "
+        f"{_SENSITIVE_MODULE_PATH}"
+    )
+_ADDITIONAL_MODULE_PATH = Path(addm.__file__).resolve()
+if _NETHOBENCH_INSTALL.resolve() not in _ADDITIONAL_MODULE_PATH.parents:
+    raise RuntimeError(
+        "Resolved Nethobench metrics outside nethobench: "
+        f"{_ADDITIONAL_MODULE_PATH}"
+    )
 
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -50,14 +72,6 @@ def load_module_from_path(module_name: str, path: Path):
     return module
 
 
-addm = load_module_from_path(
-    "_nethobench_additional_neuro_metrics",
-    NETHOBENCH_PKG / "analysis" / "additional_neuro_metrics.py",
-)
-smc = load_module_from_path(
-    "_nethobench_sensitive_metric_candidates",
-    NETHOBENCH_PKG / "analysis" / "sensitive_metric_candidates.py",
-)
 base = load_module_from_path(
     "_neuro_eval_common",
     Path(__file__).resolve().parent / "neuro_eval_common.py",
@@ -65,6 +79,8 @@ base = load_module_from_path(
 
 
 EPS = 1e-12
+FULL_SEQUENCE_LENGTH = 810
+CONTEXT_STEPS = 90
 
 SELECTED_METRICS = base.SELECTED_METRICS
 
@@ -76,8 +92,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=_REPO_ROOT / "evaluation_results" / "90_810" / "seed_102",
-        help="Directory containing the 90_810 .npy tensors (GT/prediction stacks).",
+        default=_REPO_ROOT / "evaluation_results" / "90_810",
+        help=(
+            "Root containing val_seed_102_train_seed_* directories, or one "
+            "explicit directory containing 90_810 tensors."
+        ),
+    )
+    parser.add_argument(
+        "--score-cache",
+        type=Path,
+        default=(
+            _REPO_ROOT
+            / "output"
+            / "neuro_subscores_from_npy_merged_4split_3seeds_new"
+            / "scores_cache_90_810_4split_3seeds.json"
+        ),
+        help="Existing three-training-seed official Nethobench score cache.",
     )
     parser.add_argument(
         "--output-dir",
@@ -93,11 +123,69 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-scores",
         action="store_true",
-        help="Recompute official split scores if score CSV export is enabled.",
+        help=(
+            "Ignore --score-cache and recompute official split scores with "
+            "the nethobench checkout."
+        ),
     )
     parser.add_argument("--n-splits", type=int, default=base.N_SPLITS)
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
+
+
+def load_three_seed_model_arrays(
+    data_dir: Path,
+    score_cache: Path,
+) -> dict[str, base.ModelArrays]:
+    """Load and concatenate predictions from the cache-declared seed folders."""
+    if (data_dir / next(iter(base.MODEL_FILES.values()))).is_file():
+        seed_dirs = [data_dir]
+    else:
+        if not score_cache.is_file():
+            raise FileNotFoundError(
+                f"Score cache is required to identify training-seed folders: "
+                f"{score_cache}"
+            )
+        payload = json.loads(score_cache.read_text(encoding="utf-8"))
+        folder_names = payload.get("_cache_signature", {}).get("seed_folders")
+        if not isinstance(folder_names, list) or not folder_names:
+            raise ValueError(
+                f"{score_cache} does not declare non-empty seed_folders"
+            )
+        seed_dirs = [data_dir / str(folder_name) for folder_name in folder_names]
+
+    loaded_by_seed = [base.load_model_arrays(seed_dir) for seed_dir in seed_dirs]
+    combined: dict[str, base.ModelArrays] = {}
+    for model in base.MODEL_ORDER:
+        seed_arrays = [arrays[model] for arrays in loaded_by_seed]
+        gt_keys = {arrays.gt_key for arrays in seed_arrays}
+        if len(gt_keys) != 1:
+            raise ValueError(f"Inconsistent ground-truth keys for {model}: {gt_keys}")
+        # Match the four-split scoring scripts: tensors with 810 prediction
+        # samples contain 90 context samples followed by the 720-sample
+        # forecast.  Align each training seed before concatenating it for the
+        # diagnostic plots.  The former generic min-shape alignment silently
+        # included the context window in every visualization.
+        aligned = [
+            align_forecast_only(
+                arrays.gt,
+                arrays.pred,
+                full_sequence_length=FULL_SEQUENCE_LENGTH,
+                context_steps=CONTEXT_STEPS,
+            )
+            for arrays in seed_arrays
+        ]
+        combined[model] = base.ModelArrays(
+            gt=np.concatenate([pair[0] for pair in aligned], axis=0),
+            pred=np.concatenate([pair[1] for pair in aligned], axis=0),
+            gt_key=seed_arrays[0].gt_key,
+        )
+
+    print(
+        "Loaded prediction tensors from:",
+        ", ".join(seed_dir.name for seed_dir in seed_dirs),
+    )
+    return combined
 
 
 def selected_metric_keys() -> list[str]:
@@ -459,9 +547,9 @@ def extract_graph(gt: np.ndarray, pred: np.ndarray) -> dict[str, np.ndarray | fl
     gt, pred = align_for_metric(gt, pred)
     xg = gt.reshape(-1, gt.shape[-1])
     xp = pred.reshape(-1, pred.shape[-1])
-    xg, xp = smc._finite_rows(xg, xp)
-    cg = smc._safe_corrcoef(xg)
-    cp = smc._safe_corrcoef(xp)
+    xg, xp = smc.finite_rows(xg, xp)
+    cg = smc.safe_corrcoef(xg)
+    cp = smc.safe_corrcoef(xp)
     if cg is None or cp is None:
         raise ValueError("Insufficient finite rows for graph metric.")
     ag = binary_topology_from_corr(cg)
@@ -543,10 +631,10 @@ def state_bundle_from_ref(ref: dict[str, object], k: int, lag: int | None = None
 
 def extract_trajectory(gt: np.ndarray, pred: np.ndarray) -> dict[str, np.ndarray | float]:
     """TRJDIST_score01: exact GT-PCA occupancy, speed/turn, and path features."""
-    gt, pred = smc._align_arrays(gt, pred)
+    gt, pred = smc.align_arrays(gt, pred)
     xg = gt.reshape(-1, gt.shape[-1])
     xp = pred.reshape(-1, pred.shape[-1])
-    xg, xp = smc._finite_rows(xg, xp)
+    xg, xp = smc.finite_rows(xg, xp)
     xg_z, xp_z = smc._standardize_with_gt(xg, xp)
     k = smc._choose_k(xg_z, k_max=min(3, xg_z.shape[1]))
     from sklearn.decomposition import PCA
@@ -582,7 +670,7 @@ def extract_trajectory(gt: np.ndarray, pred: np.ndarray) -> dict[str, np.ndarray
             radius = np.mean(np.linalg.norm(z - np.mean(z, axis=0, keepdims=True), axis=1))
             persistence = disp / (path + smc.EPS)
             speed = np.linalg.norm(v, axis=1)
-            speed_lag1 = smc._corr_score(speed[1:], speed[:-1])
+            speed_lag1 = smc.correlation_score(speed[1:], speed[:-1])
             return np.asarray([path, disp, radius, persistence, speed_lag1], dtype=np.float64)
 
         if seq_g.shape[0] > 4:
@@ -624,42 +712,35 @@ def extract_mani(gt: np.ndarray, pred: np.ndarray) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-def plot_kl(model_arrays: dict[str, base.ModelArrays], output_dir: Path) -> str:
+def plot_kl(
+    model_arrays: dict[str, base.ModelArrays],
+    output_dir: Path,
+    official_means: dict[str, dict[str, float]],
+) -> str:
     # Raw quantity: symmetric KL per sequence and region. Lower KL is better;
     # the scalar score converts KL to similarities 1/(1+KL), geometric-averages
     # regions per sequence, then averages mean and q10 sequence similarity.
-    fig, axes = plt.subplots(len(base.MODEL_ORDER), 2, figsize=(10.6, 2.45 * len(base.MODEL_ORDER)), constrained_layout=True)
-    for row, model in enumerate(base.MODEL_ORDER):
+    fig, axes = plt.subplots(
+        1,
+        len(base.MODEL_ORDER),
+        figsize=(2.8 * len(base.MODEL_ORDER), 2.9),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for column, model in enumerate(base.MODEL_ORDER):
         gt, pred = align_for_metric(model_arrays[model].gt, model_arrays[model].pred)
         ext = extract_kl(gt, pred)
-        gt_vals = gt[np.isfinite(gt)]
-        pred_vals = pred[np.isfinite(pred)]
-        pool = np.concatenate([gt_vals, pred_vals])
-        lo, hi = np.quantile(pool, [0.001, 0.999])
-        if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
-            lo, hi = float(np.nanmin(pool)), float(np.nanmax(pool))
-        bins = np.linspace(lo, hi, 80)
-
-        ax = axes[row, 0]
-        ax.hist(gt_vals, bins=bins, density=True, alpha=0.45, color="black", label="GT")
-        ax.hist(pred_vals, bins=bins, density=True, alpha=0.55, color=base.MODEL_COLORS[model], label="Prediction")
-        ax.set_yscale("log")
-        ax.set_title(f"{base.MODEL_LABELS[model]} score={ext['score']:.3f}")
-        ax.set_xlabel("Pooled activity value")
-        ax.set_ylabel("Density (log)")
-        if row == 0:
-            ax.legend(frameon=False, fontsize=8)
-
-        ax = axes[row, 1]
+        ax = axes[0, column]
         vals = ext["kl_sym"].ravel()
         vals = vals[np.isfinite(vals)]
         ax.hist(vals, bins=40, color=base.MODEL_COLORS[model], alpha=0.78)
         median_kl = float(np.nanmedian(vals)) if vals.size else np.nan
         ax.axvline(median_kl, color="black", ls="--", lw=1)
-        ax.set_title(f"median KL={median_kl:.3f}; mean/q10 sim={ext['KL_mean']:.3f}/{ext['KL_q10']:.3f}")
+        score = official_means[model]["KL_or_JSD_score01"]
+        ax.set_title(f"{base.MODEL_LABELS[model]} score={score:.3f}", fontsize=9)
         ax.set_xlabel("Symmetric KL per sequence-region")
         ax.set_ylabel("Count")
-    fig.suptitle("KL_or_JSD_score01: GT/pred pooled densities plus official symmetric-KL distribution", y=1.01)
+        ax.set_box_aspect(0.9)
     return save(fig, output_dir, "metric_KL_or_JSD_gt_pred_histograms.svg")
 
 
@@ -753,7 +834,11 @@ def plot_mom(model_arrays: dict[str, base.ModelArrays], output_dir: Path) -> str
     return save(fig, output_dir, "metric_MOM_gt_pred_moment_components.svg")
 
 
-def plot_mean(model_arrays: dict[str, base.ModelArrays], output_dir: Path) -> str:
+def plot_mean(
+    model_arrays: dict[str, base.ModelArrays],
+    output_dir: Path,
+    official_means: dict[str, dict[str, float]],
+) -> str:
     """
     Single-panel version of the mean-shift plot.
 
@@ -784,7 +869,7 @@ def plot_mean(model_arrays: dict[str, base.ModelArrays], output_dir: Path) -> st
                 "color": base.MODEL_COLORS[model],
                 "scaled": scaled,
                 "D": float(ext["D"]),
-                "score": float(ext["score"]),
+                "score": official_means[model]["Mean_score01"],
             }
         )
 
@@ -1710,7 +1795,11 @@ def plot_impulse_response(model_arrays: dict[str, base.ModelArrays], output_dir:
     )
 
 
-def plot_subspace_angles(model_arrays: dict[str, base.ModelArrays], output_dir: Path) -> str:
+def plot_subspace_angles(
+    model_arrays: dict[str, base.ModelArrays],
+    output_dir: Path,
+    official_means: dict[str, dict[str, float]],
+) -> str:
     """
     Improved visualization for SubspaceAngle_score01.
 
@@ -1739,7 +1828,11 @@ def plot_subspace_angles(model_arrays: dict[str, base.ModelArrays], output_dir: 
         angles = np.asarray(ext["angles"], dtype=np.float64)
         deg = np.degrees(angles)
         cos2 = np.cos(angles) ** 2
-        score = float(np.nanmean(cos2))
+        # The heatmap remains a pooled diagnostic, but its displayed scalar
+        # must be the four-split, per-training-seed aggregate used in the
+        # official tables.  Averaging this nonlinear metric after pooling all
+        # seeds produces a different number.
+        score = official_means[model]["SubspaceAngle_score01"]
 
         # GT variance context
         gt_flat, pred_flat = standardized_flat(model_arrays[model].gt, model_arrays[model].pred)
@@ -2026,29 +2119,48 @@ def plot_mani(model_arrays: dict[str, base.ModelArrays], output_dir: Path) -> tu
     has_ph = smc.ripser is not None
     payload = {model: extract_mani(model_arrays[model].gt, model_arrays[model].pred) for model in base.MODEL_ORDER}
 
-    fig, axes = plt.subplots(len(base.MODEL_ORDER), 2, figsize=(10.4, 2.25 * len(base.MODEL_ORDER)), constrained_layout=True)
-    for row, model in enumerate(base.MODEL_ORDER):
-        ext = payload[model]
-        for dim, label in enumerate(("H0", "H1")):
-            ax = axes[row, dim]
+    lifetime_files: list[str] = []
+    for dim, label in enumerate(("H0", "H1")):
+        fig, axes = panel_grid(len(base.MODEL_ORDER))
+        for ax, model in zip(axes, base.MODEL_ORDER):
+            ext = payload[model]
             if has_ph:
                 gt_life = ext["lifetimes_gt"][dim]
                 pred_life = ext["lifetimes_pred"][dim]
                 if gt_life.size and pred_life.size:
                     hi = max(np.nanpercentile(gt_life, 95), np.nanpercentile(pred_life, 95), EPS)
-                    bins = np.linspace(0, hi, 24)
-                    ax.hist(gt_life, bins=bins, alpha=0.45, density=True, color="black", label="GT")
-                    ax.hist(pred_life, bins=bins, alpha=0.55, density=True, color=base.MODEL_COLORS[model], label="Prediction")
+                    bins = np.linspace(0, hi, 14)
+                    ax.hist(
+                        gt_life,
+                        bins=bins,
+                        alpha=0.45,
+                        density=True,
+                        color="#1f77b4",
+                        label="GT",
+                    )
+                    ax.hist(
+                        pred_life,
+                        bins=bins,
+                        alpha=0.55,
+                        density=True,
+                        color="#ff7f0e",
+                        label="Pred",
+                    )
                 else:
                     ax.text(0.5, 0.5, "No finite lifetimes", ha="center", va="center", transform=ax.transAxes)
             else:
                 ax.text(0.5, 0.5, "ripser unavailable", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(f"{base.MODEL_LABELS[model]} {label} lifetimes" if dim == 0 else f"{label} lifetimes", fontsize=8)
+            ax.set_title(base.MODEL_LABELS[model], fontsize=9)
             ax.set_xlabel("Lifetime")
             ax.set_ylabel("Density")
-    axes[0, 0].legend(frameon=False, fontsize=8)
-    fig.suptitle("MANI_score01 topology term: GT vs prediction PH lifetimes", y=1.01)
-    lifetime_file = save(fig, output_dir, "metric_MANI_ph_lifetimes_gt_pred.svg")
+        axes[0].legend(frameon=False, fontsize=8)
+        finalize_unused_axes(axes, len(base.MODEL_ORDER))
+        filename = (
+            "metric_MANI_ph_lifetimes_gt_pred.svg"
+            if dim == 0
+            else "metric_MANI_ph_H1_lifetimes_gt_pred.svg"
+        )
+        lifetime_files.append(save(fig, output_dir, filename))
 
     fig, axes = panel_grid(len(base.MODEL_ORDER))
     for ax, model in zip(axes, base.MODEL_ORDER):
@@ -2067,7 +2179,7 @@ def plot_mani(model_arrays: dict[str, base.ModelArrays], output_dir: Path) -> tu
         if has_ph
         else "ripser is unavailable; PH panels are unavailable and the kNN profile file shows the exact official local geometry object."
     )
-    return f"{lifetime_file}; {knn_file}", has_ph, notes
+    return f"{'; '.join(lifetime_files)}; {knn_file}", has_ph, notes
 
 
 def plot_state_occupancy(
@@ -2301,22 +2413,91 @@ def filename_text(filename: str | tuple[str, ...]) -> str:
 def export_official_score_tables(
     model_arrays: dict[str, base.ModelArrays],
     output_dir: Path,
+    score_cache: Path,
     region_names: list[str],
     n_splits: int,
     force_scores: bool,
-) -> None:
-    means, sems, _ = base.compute_or_load_scores(
-        model_arrays=model_arrays,
-        output_dir=output_dir,
-        region_names=region_names,
-        n_splits=n_splits,
-        force_scores=force_scores,
-    )
+) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    if force_scores:
+        means, sems, _ = base.compute_or_load_scores(
+            model_arrays=model_arrays,
+            output_dir=output_dir,
+            region_names=region_names,
+            n_splits=n_splits,
+            force_scores=True,
+        )
+    else:
+        means, sems = load_three_seed_score_cache(score_cache, n_splits)
     metric_df, metric_sem_df, family_df, family_sem_df = base.score_tables(means, sems)
     metric_df.to_csv(output_dir / "selected_nethobench_submetrics_mean.csv", float_format="%.6f")
     metric_sem_df.to_csv(output_dir / "selected_nethobench_submetrics_sem.csv", float_format="%.6f")
     family_df.to_csv(output_dir / "nethobench_family_scores_mean.csv", float_format="%.6f")
     family_sem_df.to_csv(output_dir / "nethobench_family_scores_sem.csv", float_format="%.6f")
+    return means, sems
+
+
+def load_three_seed_score_cache(
+    score_cache: Path,
+    expected_splits: int,
+) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    """Aggregate the existing cache using the original nested seed design."""
+    if not score_cache.is_file():
+        raise FileNotFoundError(f"Official score cache not found: {score_cache}")
+    payload = json.loads(score_cache.read_text(encoding="utf-8"))
+    signature = payload.get("_cache_signature", {})
+    if int(signature.get("n_splits", -1)) != expected_splits:
+        raise ValueError(
+            f"{score_cache} declares n_splits={signature.get('n_splits')}; "
+            f"expected {expected_splits}"
+        )
+    scores = payload.get("scores")
+    if not isinstance(scores, dict) or not scores:
+        raise ValueError(f"{score_cache} has no non-empty 'scores' mapping")
+
+    per_seed_means: dict[str, dict[str, dict[str, float]]] = {}
+    for training_seed, model_scores in scores.items():
+        if not isinstance(model_scores, dict):
+            raise ValueError(f"Invalid model mapping for training seed {training_seed}")
+        per_seed_means[training_seed] = {}
+        for model in base.MODEL_ORDER:
+            splits = model_scores.get(model)
+            if not isinstance(splits, list) or len(splits) != expected_splits:
+                raise ValueError(
+                    f"{model} at training seed {training_seed} does not have "
+                    f"exactly {expected_splits} cached splits"
+                )
+            per_seed_means[training_seed][model], _ = base.aggregate_split_scores(
+                splits
+            )
+
+    means: dict[str, dict[str, float]] = {}
+    sems: dict[str, dict[str, float]] = {}
+    for model in base.MODEL_ORDER:
+        score_names = sorted(
+            {
+                score_name
+                for seed_means in per_seed_means.values()
+                for score_name in seed_means[model]
+            }
+        )
+        means[model] = {}
+        sems[model] = {}
+        for score_name in score_names:
+            values = np.asarray(
+                [
+                    seed_means[model].get(score_name, np.nan)
+                    for seed_means in per_seed_means.values()
+                ],
+                dtype=float,
+            )
+            means[model][score_name] = float(np.nanmean(values))
+            sems[model][score_name] = base.nansem(values)
+
+    print(
+        f"Loaded official scores for {len(scores)} training seeds from "
+        f"{score_cache}; no scores recomputed"
+    )
+    return means, sems
 
 
 def main() -> None:
@@ -2324,32 +2505,55 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     base.setup_plot_style()
 
-    model_arrays = base.load_model_arrays(args.data_dir)
+    model_arrays = load_three_seed_model_arrays(args.data_dir, args.score_cache)
     n_reg = next(iter(model_arrays.values())).gt.shape[2]
     region_names = [f"R{i}" for i in range(n_reg)]
 
-    if not args.skip_score_cache:
-        export_official_score_tables(model_arrays, args.output_dir, region_names, args.n_splits, args.force_scores)
+    # Load the official split-then-seed aggregates even when CSV export is
+    # disabled: figure annotations must never be recomputed on the pooled
+    # plotting tensor.  ``--force-scores`` retains its explicit recomputation
+    # behavior and uses the now forecast-aligned plotting arrays.
+    if args.force_scores:
+        official_means, official_sems = export_official_score_tables(
+            model_arrays,
+            args.output_dir,
+            args.score_cache,
+            region_names,
+            args.n_splits,
+            args.force_scores,
+        )
+    else:
+        official_means, official_sems = load_three_seed_score_cache(
+            args.score_cache, args.n_splits
+        )
+        if not args.skip_score_cache:
+            metric_df, metric_sem_df, family_df, family_sem_df = base.score_tables(
+                official_means, official_sems
+            )
+            metric_df.to_csv(args.output_dir / "selected_nethobench_submetrics_mean.csv", float_format="%.6f")
+            metric_sem_df.to_csv(args.output_dir / "selected_nethobench_submetrics_sem.csv", float_format="%.6f")
+            family_df.to_csv(args.output_dir / "nethobench_family_scores_mean.csv", float_format="%.6f")
+            family_sem_df.to_csv(args.output_dir / "nethobench_family_scores_sem.csv", float_format="%.6f")
 
     manifest: list[dict[str, object]] = []
 
-    #add_manifest(manifest, "KL_or_JSD_score01", "Pooled GT activity density, pooled prediction activity density, and per-sequence/region trimmed-histogram symmetric KL distribution.", filename_text(plot_kl(model_arrays, args.output_dir)), notes="Mirrors the KL/JSD notebook cell: 60 interior bins plus two tail bins, support_q=(0.001,0.999); figure includes GT, prediction, and KL mismatch views.")
-    #add_manifest(manifest, "QNT_score01", "Pooled GT quantile curve, pooled prediction quantile curve, and official normalized tail quantile error curve.", filename_text(plot_qnt(model_arrays, args.output_dir)), notes="Mirrors q=0.01..0.99, n_q=99, max_time=1200, rng_seed=0; plot includes GT and prediction quantile objects plus error.")
+    add_manifest(manifest, "KL_or_JSD_score01", "Pooled forecast-only GT activity density, pooled prediction activity density, and per-sequence/region trimmed-histogram symmetric KL distribution.", filename_text(plot_kl(model_arrays, args.output_dir, official_means)), notes="Raw distributions use the forecast-only window. Displayed scores are the official four-split means averaged within training seed and then across training seeds.")
+    add_manifest(manifest, "QNT_score01", "Pooled GT quantile curve, pooled prediction quantile curve, and official normalized tail quantile error curve.", filename_text(plot_qnt(model_arrays, args.output_dir)), notes="Mirrors q=0.01..0.99, n_q=99, max_time=1200, rng_seed=0; plot includes GT and prediction quantile objects plus error.")
     add_manifest(manifest, "MOM_score01", "GT/pred variance ratio, signed skewness/kurtosis differences, and official weighted component distances.", filename_text(plot_mom(model_arrays, args.output_dir)), notes="Uses the legacy perfected moment score path called by compute_moment_score01; plot includes signed GT-pred moment context and distance components.")
-    #add_manifest(manifest, "Mean_score01", "GT regional means, prediction regional means, signed Pred-GT regional mean shifts, and IQR-scaled absolute mean shifts.", filename_text(plot_mean(model_arrays, args.output_dir)), notes="Mirrors the notebook top-10% mean-shift formula; plot includes GT, prediction, signed delta, and official scaled error.")
-    #add_manifest(manifest, "TRJDIST_score01", "Official GT-PCA component distances plus GT/pred speed distributions, turn distributions, and path feature relative differences.", filename_text(plot_trajectory(model_arrays, args.output_dir)), notes="Mirrors trajectory_occupancy_velocity_v4 and trajectory_path_features_v3; outputs include component mismatch and GT/pred latent-dynamics objects.")
-    #add_manifest(manifest, "GRAPH_score01", "GT correlation matrix, prediction correlation matrix, signed correlation delta, and GT/pred top-edge masks.", filename_text(plot_graph(model_arrays, args.output_dir)), notes="Uses the legacy perfected graph score path called by compute_graph_score01; triptych includes edge-overlap summaries.")
-    #add_manifest(manifest, "CrossRegionMI_score01", "GT mutual-information matrix, prediction mutual-information matrix, and signed MI delta.", filename_text(plot_cross_mi(model_arrays, args.output_dir)), notes="Uses _mi_matrix and standardization from compute_additional_structural_metrics; triptych includes GT, prediction, and delta.")
-    #add_manifest(manifest, "LaggedCovariance_score01", "GT lagged covariance matrices, prediction lagged covariance matrices, signed lagged-covariance deltas, and lag-wise mean absolute delta summary.", filename_text(plot_lagged_cov(model_arrays, args.output_dir)), notes="Uses official _lagged_covariance lags 1, 2, and 4; outputs include log-scaled lag summary and lag-1 GT/pred/delta triptych.")
-    #add_manifest(manifest, "ImpulseResponse_score01", "GT VAR(1) operator matrix, prediction VAR(1) operator matrix, and signed operator delta.", filename_text(plot_impulse_response(model_arrays, args.output_dir)), notes="Uses _var1_coefficients from compute_additional_structural_metrics; triptych includes GT, prediction, delta, Frobenius norm, and matrix correlation.")
+    add_manifest(manifest, "Mean_score01", "GT regional means, prediction regional means, signed Pred-GT regional mean shifts, and IQR-scaled absolute mean shifts.", filename_text(plot_mean(model_arrays, args.output_dir, official_means)), notes="Raw quantities use the forecast-only window; displayed scores use the official nested four-split aggregation.")
+    add_manifest(manifest, "TRJDIST_score01", "Official GT-PCA component distances plus GT/pred speed distributions, turn distributions, and path feature relative differences.", filename_text(plot_trajectory(model_arrays, args.output_dir)), notes="Mirrors trajectory_occupancy_velocity_v4 and trajectory_path_features_v3; outputs include component mismatch and GT/pred latent-dynamics objects.")
+    add_manifest(manifest, "GRAPH_score01", "GT correlation matrix, prediction correlation matrix, signed correlation delta, and GT/pred top-edge masks.", filename_text(plot_graph(model_arrays, args.output_dir)), notes="Uses the legacy perfected graph score path called by compute_graph_score01; triptych includes edge-overlap summaries.")
+    add_manifest(manifest, "CrossRegionMI_score01", "GT mutual-information matrix, prediction mutual-information matrix, and signed MI delta.", filename_text(plot_cross_mi(model_arrays, args.output_dir)), notes="Uses _mi_matrix and standardization from compute_additional_structural_metrics; triptych includes GT, prediction, and delta.")
+    add_manifest(manifest, "LaggedCovariance_score01", "GT lagged covariance matrices, prediction lagged covariance matrices, signed lagged-covariance deltas, and lag-wise mean absolute delta summary.", filename_text(plot_lagged_cov(model_arrays, args.output_dir)), notes="Uses official _lagged_covariance lags 1, 2, and 4; outputs include log-scaled lag summary and lag-1 GT/pred/delta triptych.")
+    add_manifest(manifest, "ImpulseResponse_score01", "GT VAR(1) operator matrix, prediction VAR(1) operator matrix, and signed operator delta.", filename_text(plot_impulse_response(model_arrays, args.output_dir)), notes="Uses _var1_coefficients from compute_additional_structural_metrics; triptych includes GT, prediction, delta, Frobenius norm, and matrix correlation.")
 
-    #mani_file, mani_exact, mani_notes = plot_mani(model_arrays, args.output_dir)
-    #add_manifest(manifest, "MANI_score01", "GT and prediction H0/H1 persistent-homology lifetime distributions plus GT and prediction local 5-NN distance profiles.", filename_text(mani_file), exact=mani_exact, notes=mani_notes)
+    mani_file, mani_exact, mani_notes = plot_mani(model_arrays, args.output_dir)
+    add_manifest(manifest, "MANI_score01", "GT and prediction H0/H1 persistent-homology lifetime distributions plus GT and prediction local 5-NN distance profiles.", filename_text(mani_file), exact=mani_exact, notes=mani_notes)
 
-    #add_manifest(manifest, "SubspaceAngle_score01", "Principal angles between GT and prediction subspaces plus GT explained variance and prediction variance along GT PCs.", filename_text(plot_subspace_angles(model_arrays, args.output_dir)), notes="Uses the same covariance and subspace selection as _subspace_angle_score; variance panel adds GT/pred context for angle importance.")
-    #add_manifest(manifest, "LatentStateOccupancyK11_score01", "GT-defined K=11 latent-state occupancy histogram and prediction occupancy histogram with TV and entropy-delta summaries.", filename_text(plot_state_occupancy(model_arrays, args.output_dir, k=11)), notes="Uses _prepare_latent_state_reference and KMeans random_state=K; plot includes GT and prediction state occupancy objects.")
-    #add_manifest(manifest, "LatentStateOccupancyK12_score01", "GT-defined K=12 latent-state occupancy histogram and prediction occupancy histogram with TV and entropy-delta summaries.", filename_text(plot_state_occupancy(model_arrays, args.output_dir, k=12)), notes="Uses _prepare_latent_state_reference and KMeans random_state=K; plot includes GT and prediction state occupancy objects.")
-    """for lag in (1, 2, 3):
+    add_manifest(manifest, "SubspaceAngle_score01", "Principal angles between GT and prediction subspaces plus GT explained variance and prediction variance along GT PCs.", filename_text(plot_subspace_angles(model_arrays, args.output_dir, official_means)), notes="Raw quantities use the forecast-only window; displayed scores use the official nested four-split aggregation.")
+    add_manifest(manifest, "LatentStateOccupancyK11_score01", "GT-defined K=11 latent-state occupancy histogram and prediction occupancy histogram with TV and entropy-delta summaries.", filename_text(plot_state_occupancy(model_arrays, args.output_dir, k=11)), notes="Uses _prepare_latent_state_reference and KMeans random_state=K; plot includes GT and prediction state occupancy objects.")
+    add_manifest(manifest, "LatentStateOccupancyK12_score01", "GT-defined K=12 latent-state occupancy histogram and prediction occupancy histogram with TV and entropy-delta summaries.", filename_text(plot_state_occupancy(model_arrays, args.output_dir, k=12)), notes="Uses _prepare_latent_state_reference and KMeans random_state=K; plot includes GT and prediction state occupancy objects.")
+    for lag in (1, 2, 3):
         add_manifest(
             manifest,
             f"LatentStateTransitionLag{lag}K11_score01",
@@ -2358,7 +2562,7 @@ def main() -> None:
             notes="Uses _prepare_latent_state_reference, K=11, and the official transition lag; triptych includes TV, mean absolute delta, and self-transition summaries.",
         )
 
-    write_manifest(manifest, args.output_dir)"""
+    write_manifest(manifest, args.output_dir)
     print(f"Saved metric-specific visualizations and manifest to: {args.output_dir}")
 
 

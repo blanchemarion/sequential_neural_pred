@@ -1,11 +1,6 @@
 import torch
 import numpy as np
 
-import matplotlib as mpl
-mpl.rcParams["text.usetex"] = False
-mpl.rcParams["svg.fonttype"] = "path"
-mpl.rcParams["font.family"] = "DejaVu Sans"
-
 import matplotlib.pyplot as plt
 
 from pathlib import Path
@@ -13,6 +8,11 @@ import re
 from typing import Dict, List, Tuple, Optional, Any
 
 from itertools import combinations
+
+from cns_plotting import setup_cnsplots_style
+
+
+setup_cnsplots_style({"text.usetex": False})
 
 
 def _ensure_list_of_dicts(x):
@@ -411,6 +411,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 

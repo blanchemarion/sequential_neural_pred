@@ -387,7 +387,7 @@ def checkpoint_payload(
     config: dict,
     epoch: int,
     train_metrics: dict[str, float],
-    validation_metrics: float,
+    validation_metrics: dict[str, float],
     beta: float,
 ) -> dict:
     return {
@@ -401,6 +401,8 @@ def checkpoint_payload(
         "validation_metrics": dict(validation_metrics),
         "validation_mean_forecast_mse":
             float(validation_metrics["mse"]),
+        "validation_mean_forecast_mae":
+            float(validation_metrics["mae"]),
         "beta": float(beta),
         "parameter_count": int(model.count_parameters()),
         "transition_spectral_norm": model.transition_spectral_norm(),
@@ -424,6 +426,11 @@ def plot_history(history: list[dict], save_dir: Path) -> None:
         epochs,
         [row["validation_mean_forecast_mse"] for row in history],
         label="Validation mean MSE",
+    )
+    axes[1].plot(
+        epochs,
+        [row["validation_mean_forecast_mae"] for row in history],
+        label="Validation mean MAE (checkpoint selection)",
     )
     axes[1].set_xlabel("Epoch")
     axes[1].legend()
@@ -489,7 +496,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     history: list[dict] = []
-    best_validation_mse = float("inf")
+    best_validation_mae = float("inf")
     best_epoch = 0
     no_improvement = 0
     last_payload = None
@@ -524,7 +531,7 @@ def main(argv: list[str] | None = None) -> None:
             seed=int(config["validation_seed"]),
         )
 
-        validation_mse = validation_metrics["mse"]
+        validation_mae = validation_metrics["mae"]
         row = {
             "epoch": epoch,
             "beta": beta,
@@ -593,31 +600,31 @@ def main(argv: list[str] | None = None) -> None:
         ):
             torch.save(last_payload, save_dir / f"checkpoint_fixed_epoch_{epoch}.pt")
 
-        if validation_mse < best_validation_mse - float(
+        if validation_mae < best_validation_mae - float(
             config["early_stop_min_delta"]
         ):
-            best_validation_mse = validation_mse
+            best_validation_mae = validation_mae
             best_epoch = epoch
             no_improvement = 0
             torch.save(last_payload, save_dir / "best_model.pt")
         else:
             no_improvement += 1
         if no_improvement >= int(config["early_stop_patience"]):
-            print(f"Early stopping: best mean-forecast MSE at epoch {best_epoch}.")
+            print(f"Early stopping: best mean-forecast MAE at epoch {best_epoch}.")
             break
 
     if last_payload is None:
         raise RuntimeError("No training epoch completed")
     last_payload["history"] = history
     last_payload["best_epoch"] = best_epoch
-    last_payload["best_validation_mean_forecast_mse"] = best_validation_mse
+    last_payload["best_validation_mean_forecast_mae"] = best_validation_mae
     torch.save(last_payload, save_dir / "final_model.pt")
     (save_dir / "training_history.json").write_text(
         json.dumps(history, indent=2), encoding="utf-8"
     )
     plot_history(history, save_dir)
     print(
-        f"Best context-only generative mean MSE: {best_validation_mse:.6f} "
+        f"Best context-only generative mean MAE: {best_validation_mae:.6f} "
         f"(epoch {best_epoch})"
     )
 

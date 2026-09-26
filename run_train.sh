@@ -1,9 +1,8 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
 # ---- paths ----
-PROJECT_DIR="/home/lyceum/blanche/sequential_neural_pred" 
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$PROJECT_DIR/data_raw"
 CKPT_DIR="$PROJECT_DIR/checkpoints"
 OUT_DIR="$PROJECT_DIR/output"

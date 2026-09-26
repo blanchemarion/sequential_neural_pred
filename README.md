@@ -1,149 +1,124 @@
-# Sequential neural forecasting for widefield calcium dynamics
+# Sequential neural forecasting
 
-This repository implements **decoder-only Transformer models** and evaluation tooling for **multi-step forecasting** of population neural activity organized as multivariate time series. It targets recordings observed over many timesteps and summarized per timestep by activity in multiple brain regions or neurons.
+Code for forecasting population neural activity from an observed time series. The analyses cover widefield calcium recordings and two photon fluorescence traces. The widefield experiments compare a causal, decoder only Transformer with linear autoregression (VAR), an autoregressive GRU, and a conditional deep Markov state space model (cDMM SSM). A population conditioned MLP provides a separate baseline for two photon traces. The repository also contains long horizon evaluation and neural realism scoring code used in the accompanying article.
 
-The code supports several training–inference **regimes** (including pure autoregressive self-feedback, and teacher forcing–style supervision), **sensitivity analyses** over dataset size, brain-region cardinality, and input horizon, **linear VAR-style baselines**, and **population-conditioned MLP baselines** on dense two-photon–style traces stored as CSV. The repository-root file **`globals.json`** centralizes paths and hyperparameter defaults so experiments stay reproducible and consistent across preparation, training, and inference scripts.
-
----
-
-## Scientific scope
-
-- **Task.** Predict future activity conditioned on an observed prefix of length \(T_{\mathrm{in}}\). Outputs use horizon \(T_{\mathrm{out}}\).
-- **Data.** Wide-format tabular exports keyed by sequence and timestep identifiers (`sequenceId`, `itemPosition`), with one column per region or neuron. The preparation utilities reshape contiguous subsequences into 4D arrays suited to batched training.
-- **Models.** Core neural predictor: causal Transformer encoder over concatenated history and prediction horizon (`src/models/models.py`), with **KV-cache** optimization for efficient long rollouts (`src/models/model_KV_cached.py`). Auxiliary **`train_var_baseline.py`** / **`inference_var_baseline.py`** implement vector-autoregressive-style linear comparisons (`src/models/model_var_baseline.py`).
-- **Two-photon–style traces.** **`train_MLP_2p.py`** and **`inference_MLP_2p.py`** train an **`MLP2P`** architecture (`src/models/mlp_2p.py`): per-neuron temporal embeddings conditioned on a learned population summary, suited to nonnegative continuous fluorescence traces supplied as matrix CSV (rows = neurons, columns = time; see script `--csv_path`).
-
----
+This README describes the analysis code and its inputs. Reported numerical results should be taken from the article and the exact experiment outputs used to prepare its figures.
 
 ## Requirements
 
-- **Python** 3.11 recommended (see `run_sensitity.sh` / `run_train.sh` for conda/venv bootstrap patterns).
-- **PyTorch** 2.x with CUDA when available (shell helpers pin a CUDA 12.4 wheel line for reproducibility; adjust for your hardware via [pytorch.org](https://pytorch.org/get-started/locally/)).
-- **`requirements.txt`** lists NumPy, Pandas, PyArrow, Matplotlib, Seaborn, tqdm, SciPy, and scikit-learn.
-
-Install dependencies:
+Use Python 3.11 and install PyTorch for your CPU or CUDA platform, then the Python dependencies:
 
 ```bash
-pip install -r requirements.txt
-pip install torch  # choose CPU/GPU build appropriate for your machine
+python -m pip install torch
+python -m pip install -r requirements.txt
+python -m pip install -e ./nethobench
 ```
 
----
+The last command installs the NethoBench package included in this repository; no separate checkout is needed. Large training and scoring runs may require a CUDA GPU and substantial memory.
 
-## Configuration: `globals.json`
+## Reproduce a reported analysis figure
 
-The JSON file at the repository root is the **single shared configuration**, with sections:
+See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for the pinned widefield dataset
+and checkpoint releases, SHA-256 checks, and a command that rebuilds the
+90/810 family-score table and bar figure from the released split-level scores.
+The short path is:
 
-- **`paths`** — directory prefixes for raw/processed data, configs, checkpoints, predictions, evaluation outputs.
-- **`prepare_data`** — parquet ingestion knobs (filename, partitions over data share and brain-region cardinality, subsequence length, RNG seeds).
-- **`train_sensitivity.base_config`** — default Transformer hyperparameters merged under every run config (architecture, optimizer, scheduler, loss weights, checkpointing).
-- **`generate_configs`** — grid choices for sensitivity sweeps (`t_in_choices`, seeds, `share_to_num_epochs`).
-- **`inference_sensitivity`** — long-rollout defaults (number of validation sequences, autoregressive horizon, number of plot examples).
+```bash
+python reproduce_90_810_summary.py
+```
 
-Every pipeline stage honors **`--globals /path/to/custom.json`** to swap experiments without editing source. If the file is absent or incomplete, scripts merge sensible programmatic defaults (`src/helpers/globals.py`).
+The command verifies the 424-row score summary and writes the table and figure
+under `output/reproduced_90_810_summary/`. Large data and checkpoints are
+downloaded separately; the bundled score cache makes this figure reproducible
+without fetching either artifact.
 
----
+## Data and configuration
 
-## Pipeline A — Sensitivity analysis (parquet → training → long inference)
+Widefield preparation expects a Parquet table with `sequenceId`, `itemPosition`, and one numeric column per brain region. Rows within a sequence must be ordered by time. The preparation code also reads the corresponding metadata JSON. The main preparation workflow produces an array with axes `(sequence, subsequence, region, time)` and a metadata sidecar.
 
-This pipeline produces controlled sweeps over dataset share, number of brain regions, input horizon \(T_{\mathrm{in}}\), and random seed, enabling **sensitivity analyses** of forecasting quality with respect to those axes.
+The two photon MLP reads a headerless CSV matrix with **neurons in rows and time points in columns**. `src/prepare/prepare_2p_traces.py` can convert this format for the array based workflows.
 
-Typical order:
+`globals.json` defines input and export locations, data partitions, model defaults, training seeds, and inference horizons. Edit it for your data and experiment settings before running the workflows. The sensitivity and GRU/SSM entry points also accept `--globals` to load another configuration file; consult each script's `--help` for available overrides. Keep the configuration snapshot, source revision, input data version, and selected checkpoints with any reported result.
 
-1. **`src/prepare/prepare_sensitivity.py`** — ingest raw parquet + metadata, sample sequences and regions per globals, export partitioned `.npy` tensors plus JSON metadata beside them for reproducibility.
-2. **`src/prepare/generate_configs.py`** — scan exported tensors and write per-run JSON specs (e.g., \(T_{\mathrm{in}}\), seeds, epochs keyed off dataset share names).
-3. **`src/train/train_sensitivity.py`** — enumerate configs (defaults to JSON/YAML under the configured configs directory), train with **`CombinedLoss`** (MAE core plus optional distributional/shape terms when weighted), save checkpoints and normalized validation tensors plus sequence-ID sidecars for stitching long horizons.
-4. **`src/infer/inference_sensitivity.py`** — load checkpoints and matched processed splits; run long autoregressive forecasts (length set via globals); stack predictions and aligned ground-truth into `.npy` archives suitable for downstream metrics/plots.
+The default widefield settings use 90 observed steps and 90 training target steps for the main model comparison. Long horizon evaluation extends forecasts to 720 future steps for the main comparison and 810 future steps for the sensitivity workflow. These are different evaluation protocols and should be reported separately.
 
-A bundled Bash driver **`run_sensitity.sh`** mirrors this sequence (environment creation, PyTorch install, then the four Python stages).
+## Widefield workflows
 
-Optional **`src/prepare/sample_parquet_1pct.py`** subsamples sequences (~1% rows by sequence ID) for fast debugging without altering downstream filenames unexpectedly—adjust globals/metadata accordingly before serious runs.
+Run commands from the repository root after setting the data locations in `globals.json`.
 
----
-
-## Pipeline B — Multi-regime Transformer training (`prepare.py` → `train_all_regimes.py`)
-
-For richer supervisory mixtures (teacher forcing, autoregressive self-feedback—see docstrings in `src/models/model_KV_cached.py`):
+### Main model comparison
 
 ```bash
 python src/prepare/prepare.py
 python src/train/train_all_regimes.py
+python src/train/train_var_baseline.py
+python src/train/train_gru_ar.py
+python src/train/train_cdmm_ssm.py
 ```
 
-Defaults inside **`prepare.py`** target tensors aligned with `train_all_regimes.py` expectations (history/future lengths and brain-region cardinality documented at module top). Use **`run_train.sh`** on POSIX systems if you want the same conda/venv bootstrap as the sensitivity-analysis driver.
+`train_all_regimes.py` trains the Transformer with the supervision regimes selected in that file. Its implementation uses `src/models/model_KV_cached.py`, including cached key/value attention for autoregressive rollout. The other trainers implement the linear, GRU, and cDMM SSM comparisons. GRU and cDMM SSM settings are read from their sections of `globals.json`; their command line options include input array, save location, device, and training duration. The VAR trainer has its experiment settings in the script.
 
----
-
-## Evaluation and visualization
-
-**Nethobench dependency.** Neuro visualization and scoring scripts import the **`nethobench`** Python package (`compute_neuro_scores`, neuro pipeline helpers). This repository **expects a vendored copy at the repository root**: clone or copy the Nethobench sources into **`nethobench/`** next to `src/` and `globals.json` (setuptools layout so imports resolve from `<repo>/nethobench`). Scripts under **`src/visualize/`** prepend that directory to `sys.path`, so a separate **`pip install`** is not required. Alternatively you may **`pip install -e ./nethobench`** into your environment and rely on the normal import path.
-
-Install **`requirements.txt`** (includes `umap-learn` and `ripser` used by full neuro composites).
-
-- **`src/infer/inference_all_regimes.py`** — short-window versus long-window autoregressive evaluation, qualitative overlays, and metric summaries tuned inside the script (modes list and horizons).
-- **`src/visualize/plot_all_configs_learning_curves.py`** — aggregate learning curves across exported histories/checkpoints.
-- **`src/visualize/neuro_metric_specific_visualizations_90_810.py`** / **`neuro_subscores_from_npy_with_sequifier_4split.py`** — neuroscience-oriented dashboards from stacked prediction arrays; official **`compute_neuro_scores`** paths write CSV family/submetric tables where enabled.
-- **`src/visualize/neuro_subscores_from_npy_2p_4split.py`** — analogous tooling tuned for two-photon benchmark layouts referenced inside that script.
-
-**Tensor paths.** Point these utilities at **your** stacked `.npy` exports (layouts in each script’s docstring). Defaults target **`evaluation_results/<layout>/seed_102/`** at the repo root; override with each script’s CLI or constants. Figures and caches go under **`output/`** (outside `src/`), not under `nethobench/`.
-
----
-
-## Two-photon CSV baseline (`MLP2P`)
-
-The **`train_MLP_2p.py`** script trains directly from CSV traces using blocked chronological splits (train / validation / test gaps configurable via CLI). Training checkpoints feed **`inference_MLP_2p.py`** for multi-step recursive rollout (`pred_len`, stride-driven contexts).
-
-Example skeleton:
+Run the matching inference entry points on the saved checkpoints:
 
 ```bash
-python src/train/train_MLP_2p.py \
-  --csv_path path/to/traces.csv \
-  --T_in 90 \
-  --epochs 30 \
-  --output_dir path/to/checkpoints
-
-python src/infer/inference_MLP_2p.py \
-  --csv_path path/to/traces.csv \
-  --checkpoint path/to/checkpoints/best_model.pt \
-  --T_in 90 \
-  --pred_len 720 \
-  --output_dir path/to/eval_exports
+python src/infer/inference_all_regimes.py
+python src/infer/inference_var_baseline.py --help
+python src/infer/inference_gru_ar.py --help
+python src/infer/inference_cdmm_ssm.py --help
 ```
 
-**`src/prepare/prepare_2p_traces.py`** converts the same CSV layout into `.npy` archives aligned with the widefield tensor conventions when traces must enter the Transformer dataloaders; see its module docstring for matrix orientation and output naming.
+The Transformer evaluator selects modes and checkpoints through constants in `inference_all_regimes.py`. The baseline evaluators expose checkpoint and evaluation options on the command line. Inference exports aligned prediction and ground truth arrays; some entry points also write tabular scores, plots, or CSV traces.
 
----
+### Data and input horizon sensitivity
 
-## Repository layout (tracked sources)
-
-```text
-src/
-  helpers/           # globals loader, preprocessing, dataloading splits / normalization
-  models/            # Transformer core, KV-cached variant, VAR baseline, MLP2P
-  prepare/           # parquet sensitivity-analysis pipeline, regime preprocessing, utilities
-  train/             # sensitivity-analysis trainer, multi-regime trainer, baselines
-  infer/             # sensitivity-analysis rollout engine, regime evaluator, baseline/MLP2P inference
-  visualize/         # publication-style plots and neuro metric summaries
-nethobench/            # vendored Nethobench package (neuro benchmark scoring)
-globals.json
-requirements.txt
-run_sensitity.sh
-run_train.sh
-run_MLP_2p.sh
+```bash
+python src/prepare/prepare_sensitivity.py
+python src/prepare/generate_configs.py
+python src/train/train_sensitivity.py
+python src/infer/inference_sensitivity.py
 ```
 
----
+This workflow varies the fraction of sequences, number of regions, input horizon, and seed according to `globals.json`. The current configuration specifies sequence fractions of 100%, 50%, and 25%; 4, 8, and 16 regions; and input horizons of 30, 90, and 300 steps. Generated run specifications are read by the sensitivity trainer. Its inference step uses saved validation sequence identifiers to assemble long autoregressive forecasts.
 
-## Reproducibility notes for supplementary material
+## Two photon MLP workflow
 
-- **Seeds** appear in globals (`prepare_data`, `train_sensitivity.base_config`) and per-run JSON emitted by `generate_configs.py`.
-- **Normalization** follows split-aware routines in `src/helpers/preprocess_helpers.py` (input-only normalization during sensitivity-analysis training; matching transforms carried into saved validation tensors for inference).
-- **Hardware variance.** Mixed precision and optional `torch.compile` toggles live in training configs; disable if you require deterministic CPU-only traces.
-- **Long-horizon stitching.** Sensitivity-analysis inference relies on sequence-ID sidecars saved during training so validation rollouts concatenate subsequences belonging to the same underlying recording.
+The population conditioned MLP uses chronological train, validation, and test regions with configurable gaps. For a trace matrix in the format above:
 
-When citing this artifact alongside a camera-ready submission, reference the paper title/authors as specified in your proceedings entry and mention the Git commit hash and the exact `globals.json` snapshot used for each reported figure.
+```bash
+python src/train/train_MLP_2p.py --csv_path /path/to/traces.csv --output_dir /path/to/mlp_run
+python src/infer/inference_MLP_2p.py --csv_path /path/to/traces.csv --checkpoint /path/to/mlp_run/best_model.pt --output_dir /path/to/mlp_evaluation
+```
 
----
+The trainer defaults to a 90 step context and a 16 step training target. The inference script defaults to a 720 step recursive forecast. Use `--help` to set horizons, split gaps, and other options explicitly for a particular analysis.
+
+## Evaluation for the article
+
+The scripts in `src/visualize/` consume aligned forecast and ground truth arrays. `neuro_scoring_windows.py` defines the shared forecast window logic; score comparisons should use the same sequences and forecast window for every model.
+
+- `neuro_subscores_from_npy_with_sequifier_4split_3seeds.py` aggregates NethoBench scores over four validation sequence splits and independent training seeds. It reports between seed variation separately from within seed split variation and computes paired ranking tests from cached scores.
+- `neuro_metric_specific_visualizations_90_810.py` produces metric level diagnostic figures for the 90 observed plus 720 forecast step setting.
+- `analyze_pointwise_fidelity_vs_nethobench.py` compares direct forecast fidelity with structural neural realism.
+- `estimate_widefield_ceiling_floor.py` estimates reference bounds for widefield scoring.
+- `neuro_subscores_from_npy_2p_4split.py` and `neuro_subscores_from_npy_2p_4split_filtered_regions.py` evaluate two photon forecasts.
+- `plot_all_configs_learning_curves.py` plots training histories across configurations.
+
+These analyses require the corresponding aligned arrays and, where applicable, NethoBench score inputs. Script level arguments and expected array names are documented in each entry point. NethoBench computes distributional, temporal, relational, geometry, and state dynamics scores; direct fidelity measures are handled alongside them. Treat realism scores and direct pointwise errors as distinct measurements.
+
+## Source layout
+
+| Path | Role |
+| --- | --- |
+| `src/prepare/` | Widefield and two photon data preparation; sensitivity run generation |
+| `src/models/` | Transformer, VAR, GRU, cDMM SSM, and MLP implementations |
+| `src/train/` | Model training entry points |
+| `src/infer/` | Checkpoint evaluation and autoregressive forecasting |
+| `src/visualize/` | Forecast diagnostics, scoring, and figure generation |
+| `src/helpers/` | Configuration and preprocessing utilities |
+| `nethobench/` | NethoBench scoring package used by the current analysis scripts |
+
+## Reproducibility and citation
+
+For each article figure or table, record the source revision, exact `globals.json` snapshot, input data version, model checkpoint, training and evaluation seeds, forecast window, and scoring code version. The repository contains code for several analyses, so a single default run does not reproduce every article panel. Cite the accompanying article using its published bibliographic details when available, and cite this repository revision for the software.
 
 ## License
 

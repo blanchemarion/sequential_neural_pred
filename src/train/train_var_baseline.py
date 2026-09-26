@@ -126,7 +126,7 @@ def main():
         "train_ratio": 0.8,
         "split_seed": 101,
         "training_seed": 103,  # vary across 101, 102, 103
-        "save_dir": "checkpoints_VAR_BASELINE_90_90",
+        "save_dir": "checkpoints_VAR_BASELINE_90_90_seed103",
         "early_stop_patience": 25,
         "early_stop_min_delta": 1e-6,
         "checkpoint_first_epoch": 5,

@@ -5,8 +5,9 @@ Loads validation tensors saved during training, runs KV-cache rollouts to a fixe
 prediction length per sequence, writes stacked ``.npy`` archives and NeuroBench-style
 CSVs for the forecast window, and saves example overlay SVGs.
 
-Configure ``MODES``, ``SELECTED_CHECKPOINTS``, and ``EVALUATION_SEED`` below. Run from the
-repository root so checkpoint and ``data_processed`` paths resolve.
+Discovers every available training seed for the four Transformer regimes and
+writes each seed to its corresponding 90_810 evaluation directory. Run from the
+repository root so checkpoint and validation-data paths resolve.
 """
 from __future__ import annotations
 
@@ -31,7 +32,13 @@ NUM_SEQUENCES = 222
 LONG_PRED_LENGTH = 720
 EVALUATION_SEED = 102
 
-MODES = ["1_step"]
+MODE_CHECKPOINT_PREFIXES = {
+    "AR_KV": "AR_KV",
+    "TF": "TF",
+    "TF_QTL_0.08_KL_0.02": "TF_QTL_0.08_KL_0.02",
+    "1_step": "1_step",
+}
+MODES = tuple(MODE_CHECKPOINT_PREFIXES)
 
 
 def save_sequences_to_neurobench_csv(arr: np.ndarray, csv_path: str | Path, region_names=None):
@@ -211,60 +218,34 @@ def generate_long_sequence(model, initial_input, target_length, T_in, T_out, dev
 
 
 def prepare_input_and_gt(val_examples, val_seq_indices, example_idx, T_in, target_length, MAX_CONTEXT):
-    """
-    Prepare input sequence and ground truth for a given example.
-    
-    Returns:
-        input_tensor: Shape (1, T_in, n_vars)
-        gt_sequence: Shape (target_length, n_vars)
-    """
-    first_example = val_examples[example_idx].T  # (n_time, n_vars)
+    """Prepare a model context and the saved evaluation continuation."""
+    first_example = val_examples[example_idx].T
     seq_id = int(val_seq_indices[example_idx])
-    
-    # Build base context
     if first_example.shape[0] >= MAX_CONTEXT:
-        base_input = first_example[:MAX_CONTEXT, :]
+        base_input = first_example[:MAX_CONTEXT]
     else:
         pad_len = MAX_CONTEXT - first_example.shape[0]
         base_input = np.concatenate(
-            [first_example, np.repeat(first_example[-1:, :], pad_len, axis=0)],
-            axis=0
+            [first_example, np.repeat(first_example[-1:], pad_len, axis=0)], axis=0
         )
-    
-    # Model input is last T_in points
-    input_sequence = base_input[-T_in:, :]
-    
-    # Build ground truth
+    input_sequence = base_input[-T_in:]
     gt_parts = [input_sequence]
-    first_example_future = first_example[MAX_CONTEXT:, :]
-    if first_example_future.size > 0:
+    first_example_future = first_example[MAX_CONTEXT:]
+    if first_example_future.size:
         gt_parts.append(first_example_future)
-    
-    # Get remaining examples from same sequence
-    same_sequence_mask = (val_seq_indices == seq_id)
-    same_sequence_indices = np.where(same_sequence_mask)[0]
-    sorted_seq_indices = sorted(same_sequence_indices)
-    start_pos = sorted_seq_indices.index(int(example_idx))
-    used_indices = sorted_seq_indices[start_pos + 1:]
-    
-    for seq_example_idx in used_indices:
-        seq_example = val_examples[seq_example_idx].T
-        gt_parts.append(seq_example)
-    
+    same_sequence_indices = np.flatnonzero(val_seq_indices == seq_id)
+    start_pos = int(np.flatnonzero(same_sequence_indices == example_idx)[0])
+    for seq_example_idx in same_sequence_indices[start_pos + 1:]:
+        gt_parts.append(val_examples[seq_example_idx].T)
     gt_sequence = np.concatenate(gt_parts, axis=0)
-    
-    # Trim/pad to target_length
     if gt_sequence.shape[0] >= target_length:
-        gt_sequence = gt_sequence[:target_length, :]
+        gt_sequence = gt_sequence[:target_length]
     else:
         remaining = target_length - gt_sequence.shape[0]
         gt_sequence = np.concatenate(
-            [gt_sequence, np.repeat(gt_sequence[-1:, :], remaining, axis=0)],
-            axis=0
+            [gt_sequence, np.repeat(gt_sequence[-1:], remaining, axis=0)], axis=0
         )
-    
-    input_tensor = torch.tensor(input_sequence, dtype=torch.float32).unsqueeze(0)
-    return input_tensor, gt_sequence
+    return torch.tensor(input_sequence, dtype=torch.float32).unsqueeze(0), gt_sequence
 
 
 def evaluate_long_window(
@@ -466,218 +447,185 @@ def plot_prediction_examples(
         fig.savefig(output_path, format="svg")
         plt.close(fig)
 
-    print(f"  ✓ Saved {n_sequences} example plots for {mode} ({window_type})")
+    print(f"  Saved {n_sequences} example plots for {mode} ({window_type})")
+
+
+def discover_checkpoint_groups(repo_root: Path) -> dict[int, dict[str, Path]]:
+    """Find complete sets of best checkpoints, keyed by training seed."""
+    groups: dict[int, dict[str, Path]] = {}
+    for mode, prefix in MODE_CHECKPOINT_PREFIXES.items():
+        stem = f"checkpoints_{prefix}_seed"
+        for folder in repo_root.glob(f"{stem}*"):
+            if not folder.is_dir():
+                continue
+            suffix = folder.name[len(stem):]
+            if not suffix.isdecimal():
+                continue
+            checkpoint_path = folder / "best_model.pt"
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(f"Missing best checkpoint: {checkpoint_path}")
+            groups.setdefault(int(suffix), {})[mode] = checkpoint_path
+
+    if not groups:
+        raise FileNotFoundError("No Transformer best_model.pt checkpoints found")
+    for training_seed, paths in sorted(groups.items()):
+        missing = set(MODES) - paths.keys()
+        if missing:
+            raise FileNotFoundError(
+                f"Training seed {training_seed} is missing checkpoints for {sorted(missing)}"
+            )
+    return dict(sorted(groups.items()))
+
+
+def evaluation_directory(root: Path, training_seed: int) -> Path:
+    """Reuse an existing seed directory or use the standard spelling."""
+    standard = root / f"val_seed_{EVALUATION_SEED}_train_seed_{training_seed}"
+    legacy = root / f"val_seed_{EVALUATION_SEED}_train_seed{training_seed}"
+    if standard.is_dir() and legacy.is_dir():
+        raise RuntimeError(f"Two evaluation directories for seed {training_seed}: {standard}, {legacy}")
+    return legacy if legacy.is_dir() else standard
+
+
+def checkpoint_config(checkpoint_path: Path, training_seed: int, mode: str) -> dict:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config = checkpoint["config"]
+    actual_seed = int(config.get("training_seed", config.get("random_seed", training_seed)))
+    if actual_seed != training_seed:
+        raise ValueError(f"{checkpoint_path}: training seed {actual_seed} != {training_seed}")
+    expected_t_out = 1 if mode == "1_step" else 90
+    if int(config["T_in"]) != 90 or int(config["T_out"]) != expected_t_out:
+        raise ValueError(f"{checkpoint_path}: unexpected T_in/T_out for 90_810 evaluation")
+    return config
+
+
+def selected_validation_indices(
+    output_root: Path, split_seed: int, n_examples: int
+) -> np.ndarray:
+    if n_examples < NUM_SEQUENCES:
+        raise ValueError(f"Need {NUM_SEQUENCES} validation examples; found {n_examples}")
+    path = output_root / (
+        f"selected_indices_N{NUM_SEQUENCES}"
+        f"_splitseed{split_seed}_evalseed{EVALUATION_SEED}.npy"
+    )
+    if path.is_file():
+        indices = np.load(path, allow_pickle=False)
+        print(f"Using saved validation indices: {path}")
+    else:
+        indices = np.random.RandomState(EVALUATION_SEED).choice(
+            n_examples, size=NUM_SEQUENCES, replace=False
+        )
+        output_root.mkdir(parents=True, exist_ok=True)
+        np.save(path, indices)
+        print(f"Saved validation indices: {path}")
+    if (
+        indices.ndim != 1
+        or len(indices) != NUM_SEQUENCES
+        or not np.issubdtype(indices.dtype, np.integer)
+        or len(np.unique(indices)) != NUM_SEQUENCES
+        or np.any(indices < 0)
+        or np.any(indices >= n_examples)
+    ):
+        raise ValueError(f"Invalid 222-sequence selection in {path}")
+    return indices
 
 
 def main():
-    print("="*80)
-    print("COMPREHENSIVE MODEL INFERENCE EVALUATION")
-    print("="*80)
-
-
-    SELECTED_CHECKPOINTS = [
-        {
-            "config_name": "90_810",
-            "1_step": "checkpoints_1_step_seed103",
-        }
-    ]
-
-
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nDevice: {device}")
-    print(f"Number of sequences per evaluation: {NUM_SEQUENCES}")
-    print(f"Evaluation seed: {EVALUATION_SEED}")
-    print(f"Long rollout length (prediction timesteps): {LONG_PRED_LENGTH}")
-
-    # ------------------------------------------------------------
-    # Build checkpoint_pairs (unified structure: {"config_name", "modes": {...}})
-    # ------------------------------------------------------------
-    print("\n" + "="*80)
-    print("LOADING SELECTED CHECKPOINTS")
-    print("="*80)
-
-    checkpoint_pairs = []
-    for entry in SELECTED_CHECKPOINTS:
-        cfg_name = entry.get("config_name", None)
-
-        modes_info = {}
-        for mode in MODES:
-            folder = entry.get(mode, None)
-            if folder is None:
-                print(f"⚠ Missing {mode} in {entry}")
-                continue
-
-            ckpt_path = Path(folder) / "final_model.pt"
-            if not ckpt_path.exists():
-                print(f"⚠ Missing checkpoint file: {ckpt_path}")
-                continue
-
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            T_in = ckpt["config"]["T_in"]
-            T_out = ckpt["config"]["T_out"]
-
-            modes_info[mode] = {
-                "path": ckpt_path,
-                "folder_name": folder,
-                "T_in": T_in,
-                "T_out": T_out,
-            }
-
-        # require all modes
-        missing = [m for m in MODES if m not in modes_info]
-        if missing:
-            print(f"⚠ Skipping entry {cfg_name} (missing {missing})")
-            continue
-
-        tins = {modes_info[m]["T_in"] for m in MODES}
-        if len(tins) != 1:
-            print(f"⚠ Skipping entry {cfg_name} (T_in mismatch across modes)")
-            for m in MODES:
-                print(f"  {m}: T_in={modes_info[m]['T_in']}, T_out={modes_info[m]['T_out']}")
-            continue
-
-        # keep cfg_name stable even if T_out differs
-        if cfg_name is None:
-            cfg_name = f"{list(tins)[0]}_mixedTout"
-
-
-        checkpoint_pairs.append({"config_name": cfg_name, "modes": modes_info})
-
-    if not checkpoint_pairs:
-        print("❌ No valid checkpoint groups loaded. Check paths / final_model.pt existence.")
-        return
-
-    print(f"\nLoaded {len(checkpoint_pairs)} checkpoint group(s):")
-    for p in checkpoint_pairs:
-        print(f"  - {p['config_name']}: modes={list(p['modes'].keys())}")
-
-    # ------------------------------------------------------------
-    # Load validation tensors (paths from checkpoint config or data_processed fallback)
-    # ------------------------------------------------------------
-    first_pair = checkpoint_pairs[0]
-    pick_mode = next(iter(first_pair["modes"]))
-    first_checkpoint_path = first_pair["modes"][pick_mode]["path"]
-
-    print("\n" + "="*80)
-    print(f"LOADING DATA (from {pick_mode}: {first_checkpoint_path})")
-    print("="*80)
-
-    ckpt = torch.load(first_checkpoint_path, map_location=device, weights_only=False)
-    cfg = ckpt["config"]
-    split_seed = int(cfg["split_seed"] if "split_seed" in cfg else cfg["random_seed"])
-
     repo_root = Path(__file__).resolve().parents[2]
-    val_p = _resolve_existing_file(cfg.get("processed_val_examples_path"), repo_root)
-    seq_p = _resolve_existing_file(cfg.get("processed_val_seq_indices_path"), repo_root)
+    output_root = repo_root / "evaluation_results" / "90_810"
+    groups = discover_checkpoint_groups(repo_root)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Device: {device}")
+    print(f"Training seeds: {list(groups)}")
+    print(f"Models: {list(MODES)}")
+    print(f"Validation seed: {EVALUATION_SEED}")
+    print(f"Sequences per model and seed: {NUM_SEQUENCES}")
+
+    # The one-step checkpoint has a different training target length. All four
+    # models nevertheless use the same 90-step validation rows for comparison.
+    configs = {}
+    for training_seed, paths in groups.items():
+        for mode, checkpoint_path in paths.items():
+            configs[(training_seed, mode)] = checkpoint_config(
+                checkpoint_path, training_seed, mode
+            )
+
+    reference = configs[(next(iter(groups)), "AR_KV")]
+    split_seed = int(reference.get("split_seed", reference.get("random_seed")))
+    n_vars = int(reference["n_vars"])
+    data_stem = Path(reference["data_path"]).stem
+    for (training_seed, mode), cfg in configs.items():
+        cfg_split_seed = int(cfg.get("split_seed", cfg.get("random_seed")))
+        if (
+            cfg_split_seed != split_seed
+            or int(cfg["n_vars"]) != n_vars
+            or Path(cfg["data_path"]).stem != data_stem
+        ):
+            raise ValueError(
+                f"Checkpoint for {mode}, training seed {training_seed}, "
+                "uses a different validation split, data file, or region count"
+            )
+
+    val_p = _resolve_existing_file(reference.get("processed_val_examples_path"), repo_root)
+    seq_p = _resolve_existing_file(
+        reference.get("processed_val_seq_indices_path"), repo_root
+    )
     if val_p is None or seq_p is None:
-        fallback_val_p, fallback_seq_p = _build_processed_paths_from_cfg(cfg, repo_root)
+        fallback_val_p, fallback_seq_p = _build_processed_paths_from_cfg(
+            reference, repo_root
+        )
         val_p = val_p or fallback_val_p
         seq_p = seq_p or fallback_seq_p
+    if val_p is None or seq_p is None or not val_p.is_file() or not seq_p.is_file():
+        raise FileNotFoundError(
+            f"Missing processed validation arrays: {val_p}, {seq_p}"
+        )
 
-    if val_p is not None and seq_p is not None and val_p.is_file() and seq_p.is_file():
-        val_examples = np.load(val_p)
-        val_seq_indices = np.load(seq_p).astype(np.int64, copy=False)
-    else:
-        print(f"❌ Missing processed val array or sequence indices: {val_p}, {seq_p}")
-        print("   Expected checkpoint config fields or data_processed/processed_val_<run_stem>.npy fallback.")
-        return
+    val_examples = np.load(val_p, mmap_mode="r")
+    val_seq_indices = np.load(seq_p, allow_pickle=False).astype(np.int64, copy=False)
+    if len(val_examples) != len(val_seq_indices):
+        raise ValueError("Validation examples and sequence IDs have different lengths")
+    selected_indices = selected_validation_indices(
+        output_root, split_seed, len(val_examples)
+    )
 
-    # ------------------------------------------------------------
-    # Long-window evaluation → evaluation_results/<config layout>/seed_*
-    # ------------------------------------------------------------
-    base_output_dir = Path("evaluation_results")
-    main_output_dir = base_output_dir / "90_810"
+    for training_seed, paths in groups.items():
+        output_dir = evaluation_directory(output_root, training_seed)
+        print(f"Training seed {training_seed}: {output_dir}")
+        np.random.seed(EVALUATION_SEED)
+        torch.manual_seed(EVALUATION_SEED)
+        random.seed(EVALUATION_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(EVALUATION_SEED)
 
-    for pair_idx, pair in enumerate(checkpoint_pairs):
-        config_name = pair["config_name"]
-        print("\n" + "="*80)
-        print(f"PROCESSING CONFIG {pair_idx+1}/{len(checkpoint_pairs)}: {config_name}")
-        print("="*80)
-
-        for seed in [EVALUATION_SEED]:
-            print(f"\n{'='*60}")
-            print(f"SEED {seed}")
-            print(f"{'='*60}")
-
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-            random.seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-
-            n_val_examples = len(val_examples)
-            # Use main_output_dir for all results
-            main_output_dir.mkdir(parents=True, exist_ok=True)
-
-            indices_path = main_output_dir / (
-                f"selected_indices_N{NUM_SEQUENCES}"
-                f"_splitseed{split_seed}_evalseed{seed}.npy"
+        for mode in MODES:
+            checkpoint_path = paths[mode]
+            cfg = configs[(training_seed, mode)]
+            t_in, t_out = int(cfg["T_in"]), int(cfg["T_out"])
+            print(f"Evaluating {mode} from {checkpoint_path}")
+            model, _ = create_inference_model(
+                checkpoint_path, t_in, t_out, device
             )
-            if indices_path.exists():
-                selected_indices = np.load(indices_path)
-                print(f"  Loaded indices: {indices_path}")
-            else:
-                selected_indices = np.random.choice(
-                    n_val_examples,
-                    size=min(NUM_SEQUENCES, n_val_examples),
-                    replace=False
-                )
-                np.save(indices_path, selected_indices)
-                print(f"  Saved indices: {indices_path}")
+            evaluate_long_window(
+                model, checkpoint_path.parent.name, mode, t_in, t_out,
+                val_examples, val_seq_indices, selected_indices,
+                output_dir, device, EVALUATION_SEED, LONG_PRED_LENGTH, "90_810",
+            )
+            long_pred = np.load(
+                output_dir / f"long_predictions_90_810_{mode}.npy", mmap_mode="r"
+            )
+            long_gt = np.load(
+                output_dir / "long_ground_truth_90_810.npy", mmap_mode="r"
+            )
+            plot_prediction_examples(
+                long_pred, long_gt, output_dir, f"90_810_{mode}", "long",
+                n_examples=20, pred_start=t_in, seed=EVALUATION_SEED,
+            )
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-            for mode in MODES:
-                print(f"\n{'='*60}")
-                print(f"{config_name} {mode} MODEL")
-                print(f"{'='*60}")
-
-                ckpt_info = pair["modes"][mode]
-                T_in = ckpt_info["T_in"]
-                T_out = ckpt_info["T_out"]
-
-                # Save to main_output_dir with config prefix in filenames
-                output_dir = main_output_dir / f"seed_{seed}"
-                output_dir.mkdir(parents=True, exist_ok=True)
-
-                print(f"\n  Loading {config_name} {mode} model...")
-                model, _ = create_inference_model(
-                    ckpt_info["path"], T_in, T_out, device
-                )
-
-                evaluate_long_window(
-                    model,
-                    ckpt_info["folder_name"],
-                    mode,
-                    T_in,
-                    T_out,
-                    val_examples,
-                    val_seq_indices,
-                    selected_indices,
-                    output_dir,
-                    device,
-                    seed,
-                    LONG_PRED_LENGTH,
-                    config_name,
-                )
-
-                if seed == EVALUATION_SEED:
-                    long_pred = np.load(output_dir / f"long_predictions_{config_name}_{mode}.npy")
-                    long_gt = np.load(output_dir / f"long_ground_truth_{config_name}.npy")
-                    plot_prediction_examples(
-                        long_pred, long_gt, output_dir, f"{config_name}_{mode}", "long",
-                        n_examples=20, pred_start=T_in, seed=seed
-                    )
-
-                del model
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-    
-    print("\n" + "="*80)
-    print("EVALUATION COMPLETE")
-    print("="*80)
-    print(f"Results saved to: {base_output_dir}")
-
+    print(f"Evaluation complete: {output_root}")
 
 
 if __name__ == "__main__":

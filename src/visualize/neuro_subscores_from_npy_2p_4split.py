@@ -27,10 +27,14 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _NETHOBENCH_INSTALL = _REPO_ROOT / "nethobench"
-if (_NETHOBENCH_INSTALL / "nethobench" / "__init__.py").is_file():
-    _nb_path = str(_NETHOBENCH_INSTALL.resolve())
-    if _nb_path not in sys.path:
-        sys.path.insert(0, _nb_path)
+if not (_NETHOBENCH_INSTALL / "nethobench" / "__init__.py").is_file():
+    raise RuntimeError(
+        f"Required nethobench checkout not found: {_NETHOBENCH_INSTALL}"
+    )
+_nb_path = str(_NETHOBENCH_INSTALL.resolve())
+if _nb_path in sys.path:
+    sys.path.remove(_nb_path)
+sys.path.insert(0, _nb_path)
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -41,6 +45,10 @@ import pandas as pd
 import nethobench
 from nethobench import compute_neuro_scores
 from nethobench.analysis.score_definitions import NEURO_FAMILY_METRICS
+from cns_plotting import setup_cnsplots_style
+
+
+setup_cnsplots_style()
 
 # ---------------------------------------------------------------------------
 # Paths and toggles (aligned with neuro_subscores_from_npy_2p.ipynb cell 1)
@@ -328,6 +336,10 @@ CACHE_SIGNATURE = {
     "n_splits": N_SPLITS,
     "models": list(model_files.keys()),
     "sub_data_dir": sub_data_dir,
+    "metric_schema": {
+        family: list(metrics)
+        for family, metrics in NEURO_FAMILY_METRICS.items()
+    },
 }
 
 all_scores: dict[str, dict[str, float]] = {}
@@ -731,7 +743,7 @@ if RUN_FAMILY_BAR:
 # Metric dot plot (notebook cell 11) + horizontal SEM across splits
 # ---------------------------------------------------------------------------
 if RUN_METRIC_DOTPLOT:
-    mpl.rcParams.update(mpl.rcParamsDefault)
+    setup_cnsplots_style()
     mpl.rcParams["svg.fonttype"] = "none"
     mpl.rcParams["axes.linewidth"] = 0.8
 
